@@ -147,6 +147,4 @@ GitHub shares the source code between teammates. It does not connect the process
 - RM, GFD, replication, checkpoints, duplicate detection, and recovery are not required for Milestone 1.
 - Console output is the required demo interface.
 
----
 
-Source: *18-749: The Project Guide*.
