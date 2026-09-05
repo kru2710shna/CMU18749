@@ -29,6 +29,11 @@ tmux kill-session -t "$SESSION_NAME" 2>/dev/null || true
 
 tmux new-session -d -s "$SESSION_NAME" -n demo -c "$SRC_DIR"
 
+# Enable mouse mode so panes can be focused/resized by clicking, which is far
+# more reliable across terminal apps/keyboard layouts than remembering the
+# Ctrl-B + arrow-key prefix sequence for switching panes.
+tmux set -g mouse on
+
 # Layout: server+LFD stacked on the left, three clients stacked on the right.
 tmux split-window -h -t "$SESSION_NAME:demo" -c "$SRC_DIR"
 tmux split-window -v -t "$SESSION_NAME:demo.0" -c "$SRC_DIR"

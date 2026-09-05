@@ -19,7 +19,11 @@ import protocol
 
 
 def run_client(client_id: str, replica_id: str, server_host: str, server_port: int, add_amount: int, request_interval_sec: float, request_count: int) -> None:
-    sock = net_utils.connect_to_server(server_host, server_port)
+    try:
+        sock = net_utils.connect_to_server(server_host, server_port)
+    except OSError as error:
+        log_utils.log(client_id, f"Could not connect to {replica_id}: {error}", category="failure")
+        return
     log_utils.log(client_id, f"Connected to {replica_id} at {server_host}:{server_port}", category="lifecycle")
 
     request_num = 1
@@ -28,16 +32,26 @@ def run_client(client_id: str, replica_id: str, server_host: str, server_port: i
         # continuous-loop mode); otherwise stop after request_count requests.
         while request_count <= 0 or request_num <= request_count:
             request_line = protocol.build_request(client_id, replica_id, request_num, "ADD", add_amount)
-            protocol.send_line(sock, request_line)
-            log_utils.log(
-                client_id,
-                f"Sent <{client_id}, {replica_id}, {request_num}, request> (ADD {add_amount})",
-                category="request_reply",
-            )
 
-            reply_line = protocol.receive_line(sock)
-            if not reply_line:
-                log_utils.log(client_id, f"Connection to {replica_id} closed unexpectedly.", category="failure")
+            # A dead/killed server can surface as either a clean close (recv
+            # returns no data) or an OS-level socket error (e.g. connection
+            # reset, broken pipe) depending on timing - both mean the same
+            # thing to the client, so both are treated as "server is gone"
+            # instead of letting the client crash with a raw traceback.
+            try:
+                protocol.send_line(sock, request_line)
+                log_utils.log(
+                    client_id,
+                    f"Sent <{client_id}, {replica_id}, {request_num}, request> (ADD {add_amount})",
+                    category="request_reply",
+                )
+
+                reply_line = protocol.receive_line(sock)
+                if not reply_line:
+                    log_utils.log(client_id, f"Connection to {replica_id} closed unexpectedly.", category="failure")
+                    break
+            except OSError as error:
+                log_utils.log(client_id, f"Connection to {replica_id} failed: {error}", category="failure")
                 break
 
             reply = protocol.parse_message(reply_line)
