@@ -25,12 +25,20 @@ def _prompt_for_add_amount(client_id: str, default_amount: int) -> int:
     repeatedly; typing 'q' lets the operator stop the client on their own
     terms rather than waiting for Ctrl-C.
     """
-    raw_input_value = input(f"[{client_id}] Enter ADD amount (default {default_amount}, 'q' to quit): ").strip()
-    if raw_input_value.lower() == "q":
-        raise KeyboardInterrupt
-    if raw_input_value == "":
-        return default_amount
-    return int(raw_input_value)
+    # Some terminals occasionally leak stray escape-sequence bytes into stdin
+    # (e.g. a bracketed-paste or cursor-report response) right as the operator
+    # is typing. Rather than crash the whole client on one bad keystroke, keep
+    # re-prompting until we get 'q' or a valid integer.
+    while True:
+        raw_input_value = input(f"[{client_id}] Enter ADD amount (default {default_amount}, 'q' to quit): ").strip()
+        if raw_input_value.lower() == "q":
+            raise KeyboardInterrupt
+        if raw_input_value == "":
+            return default_amount
+        try:
+            return int(raw_input_value)
+        except ValueError:
+            print(f"[{client_id}] Invalid input {raw_input_value!r}, please enter a whole number or 'q'.")
 
 
 def run_client(client_id: str, replica_id: str, server_host: str, server_port: int, add_amount: int, request_interval_sec: float, request_count: int, manual_mode: bool) -> None:
