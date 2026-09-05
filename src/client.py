@@ -27,7 +27,7 @@ class Client:
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.connect((self.server_host, self.server_port))
         self.server_sockets["S1"] = sock
-        log(f"Client {self.client_id} connected to server S1 at {self.server_host}:{self.server_port}", Colors.BLUE)
+        log(f"Client {self.client_id} connected to server S1 at {self.server_host}:{self.server_port}", Colors.RESET)
 
     def send_request(self, target_replica: str = "S1", action: str = "ADD", val: int = 1):
         """
@@ -49,7 +49,7 @@ class Client:
             raise RuntimeError(f"No socket connection available for {target_replica}")
 
         req_msg = protocol.build_request(self.client_id, target_replica, self.request_num, action, val)
-        log(f"Sent <{self.client_id}, {target_replica}, {self.request_num}, request>", Colors.BLUE)
+        log(f"Sent <{self.client_id}, {target_replica}, {self.request_num}, request>", Colors.REQUEST)
         
         sock.sendall(protocol.encode_message(req_msg))
 
@@ -65,7 +65,7 @@ class Client:
                 reply_msg = messages[0]
                 break
 
-        log(f"Received <{reply_msg['client_id']}, {reply_msg['replica_id']}, {reply_msg['request_num']}, reply>", Colors.BLUE)
+        log(f"Received <{reply_msg['client_id']}, {reply_msg['replica_id']}, {reply_msg['request_num']}, reply>", Colors.REPLY)
         self.request_num += 1
 
     def run_interactive_or_loop(self, loop: bool = False, delay: float = 2.0):
@@ -79,7 +79,7 @@ class Client:
         self.connect()
         try:
             if loop:
-                log(f"Starting continuous request loop with delay {delay}s...", Colors.BLUE)
+                log(f"Starting continuous request loop with delay {delay}s...", Colors.RESET)
                 while True:
                     self.send_request("S1", "ADD", 1)
                     time.sleep(delay)
@@ -90,7 +90,7 @@ class Client:
                         break
                     self.send_request("S1", "ADD", 1)
         except (KeyboardInterrupt, ConnectionResetError, BrokenPipeError):
-            log(f"Client {self.client_id} disconnected.", Colors.BLUE)
+            log(f"Client {self.client_id} disconnected.", Colors.FAILURE)
         finally:
             for sock in self.server_sockets.values():
                 sock.close()

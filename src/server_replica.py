@@ -39,7 +39,7 @@ class ServerReplica:
         lsock.listen()
         lsock.setblocking(False)
         self.sel.register(lsock, selectors.EVENT_READ, data=None)
-        log(f"Server {self.replica_id} listening on {self.host}:{self.port} (Initial state: my_state = {self.my_state})", Colors.GREEN)
+        log(f"Server {self.replica_id} listening on {self.host}:{self.port} (Initial state: my_state = {self.my_state})", Colors.RESET)
 
     def accept_connection(self, sock: socket.socket):
         """Accepts new incoming client/LFD connection and associates per-connection buffer data."""
@@ -87,26 +87,26 @@ class ServerReplica:
             action = msg.get("action", "ADD")
             val = msg.get("val", 1)
 
-            log(f"Received <{client_id}, {self.replica_id}, {req_num}, request>", Colors.GREEN)
-            log(f"my_state_{self.replica_id} = {self.my_state} before processing <{client_id}, {self.replica_id}, {req_num}, request>", Colors.GREEN)
+            log(f"Received <{client_id}, {self.replica_id}, {req_num}, request>", Colors.REQUEST)
+            log(f"my_state_{self.replica_id} = {self.my_state} before processing <{client_id}, {self.replica_id}, {req_num}, request>", Colors.STATE)
 
             # Apply state mutation
             if action == "ADD":
                 self.my_state += val
 
-            log(f"my_state_{self.replica_id} = {self.my_state} after processing <{client_id}, {self.replica_id}, {req_num}, request>", Colors.GREEN)
+            log(f"my_state_{self.replica_id} = {self.my_state} after processing <{client_id}, {self.replica_id}, {req_num}, request>", Colors.STATE)
 
             reply = protocol.build_reply(client_id, self.replica_id, req_num, self.my_state)
-            log(f"Sending <{client_id}, {self.replica_id}, {req_num}, reply>", Colors.GREEN)
+            log(f"Sending <{client_id}, {self.replica_id}, {req_num}, reply>", Colors.REPLY)
             conn.sendall(protocol.encode_message(reply))
 
         elif msg_type == "HEARTBEAT":
             sender = msg["sender"]
             hb_count = msg["heartbeat_count"]
-            log(f"[{hb_count}] {self.replica_id} receives heartbeat from {sender}", Colors.GREEN)
+            log(f"[{hb_count}] {self.replica_id} receives heartbeat from {sender}", Colors.HEARTBEAT)
             
             alive_reply = protocol.build_alive(self.replica_id, sender, hb_count)
-            log(f"[{hb_count}] {self.replica_id} sending heartbeat ACK to {sender}", Colors.GREEN)
+            log(f"[{hb_count}] {self.replica_id} sending heartbeat ACK to {sender}", Colors.HEARTBEAT)
             conn.sendall(protocol.encode_message(alive_reply))
 
     def run(self):
@@ -121,7 +121,7 @@ class ServerReplica:
                     else:
                         self.read_connection(key, mask)
         except KeyboardInterrupt:
-            log(f"Server {self.replica_id} shutting down via Ctrl-C.", Colors.RED)
+            log(f"Server {self.replica_id} shutting down via Ctrl-C.", Colors.FAILURE)
         finally:
             self.sel.close()
 

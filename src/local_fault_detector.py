@@ -41,16 +41,16 @@ class LocalFaultDetector:
 
         try:
             sock.connect((self.server_host, self.server_port))
-            log(f"{self.lfd_id} connected to S1 at {self.server_host}:{self.server_port} with frequency {int(self.heartbeat_freq * 1000)}ms", Colors.YELLOW)
+            log(f"{self.lfd_id} connected to S1 at {self.server_host}:{self.server_port} with frequency {int(self.heartbeat_freq * 1000)}ms", Colors.RESET)
         except Exception as e:
-            log(f"{self.lfd_id} failed to connect to S1: {e}", Colors.RED)
+            log(f"{self.lfd_id} failed to connect to S1: {e}", Colors.FAILURE)
             return
 
         buffer = ""
         try:
             while True:
                 hb_msg = protocol.build_heartbeat(self.lfd_id, "S1", self.heartbeat_count)
-                log(f"[{self.heartbeat_count}] {self.lfd_id} sending heartbeat to S1", Colors.YELLOW)
+                log(f"[{self.heartbeat_count}] {self.lfd_id} sending heartbeat to S1", Colors.HEARTBEAT)
                 
                 sock.sendall(protocol.encode_message(hb_msg))
 
@@ -64,7 +64,7 @@ class LocalFaultDetector:
                     messages, buffer = protocol.parse_stream_buffer(buffer)
                     for msg in messages:
                         if msg.get("msg_type") == "ALIVE":
-                            log(f"[{self.heartbeat_count}] {self.lfd_id} received heartbeat ACK from S1", Colors.YELLOW)
+                            log(f"[{self.heartbeat_count}] {self.lfd_id} received heartbeat ACK from S1", Colors.HEARTBEAT)
                             received_ack = True
                             break
 
@@ -72,9 +72,9 @@ class LocalFaultDetector:
                 time.sleep(self.heartbeat_freq)
 
         except (socket.timeout, ConnectionResetError, BrokenPipeError):
-            log(f"S1 has died. Heartbeat timeout expiration detected at {self.lfd_id}.", Colors.RED)
+            log(f"S1 has died. Heartbeat timeout expiration detected at {self.lfd_id}.", Colors.FAILURE)
         except KeyboardInterrupt:
-            log(f"{self.lfd_id} terminated manually.", Colors.YELLOW)
+            log(f"{self.lfd_id} terminated manually.", Colors.RESET)
         finally:
             sock.close()
 
