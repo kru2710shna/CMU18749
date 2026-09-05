@@ -22,12 +22,20 @@ class Client:
         self.request_num = 1
         self.server_sockets = {}  # Extensible for multiple replicas in future milestones
 
-    def connect(self):
-        """Establishes a blocking TCP socket connection to server S1."""
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.connect((self.server_host, self.server_port))
-        self.server_sockets["S1"] = sock
-        log(f"Client {self.client_id} connected to server S1 at {self.server_host}:{self.server_port}", Colors.RESET)
+    def get_or_connect_socket(self, target_replica: str = "S1"):
+        """Returns existing socket or attempts to establish a new TCP connection."""
+        if target_replica in self.server_sockets:
+            return self.server_sockets[target_replica]
+        
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(2.0)
+            sock.connect((self.server_host, self.server_port))
+            self.server_sockets[target_replica] = sock
+            log(f"Client {self.client_id} connected to {target_replica}.", Colors.RESET)
+            return sock
+        except (ConnectionError, OSError):
+            return None
 
     def send_request(self, target_replica: str = "S1", action: str = "ADD", val: int = 1):
         """
@@ -44,29 +52,39 @@ class Client:
           3. Reads from socket until newline delimiter is reached.
           4. Decodes JSON reply, logs incoming reply tuple, and increments request_num.
         """
-        sock = self.server_sockets.get(target_replica)
+        sock = self.get_or_connect_socket(target_replica)
         if not sock:
-            raise RuntimeError(f"No socket connection available for {target_replica}")
+            log(f"<{self.client_id}, {target_replica}, {self.request_num}, request failed: {target_replica} unavailable>", Colors.FAILURE)
+            return False
 
         req_msg = protocol.build_request(self.client_id, target_replica, self.request_num, action, val)
         log(f"Sent <{self.client_id}, {target_replica}, {self.request_num}, request>", Colors.REQUEST)
-        
-        sock.sendall(protocol.encode_message(req_msg))
 
-        # Receive reply (blocking until newline framing complete)
-        buffer = ""
-        while True:
-            data = sock.recv(1024).decode("utf-8")
-            if not data:
-                raise ConnectionResetError("Server closed connection unexpectedly.")
-            buffer += data
-            messages, buffer = protocol.parse_stream_buffer(buffer)
-            if messages:
-                reply_msg = messages[0]
-                break
+        try:
+            sock.sendall(protocol.encode_message(req_msg))
 
-        log(f"Received <{reply_msg['client_id']}, {reply_msg['replica_id']}, {reply_msg['request_num']}, reply>", Colors.REPLY)
-        self.request_num += 1
+            # Receive reply (blocking until newline framing complete)
+            buffer = ""
+            while True:
+                data = sock.recv(1024).decode("utf-8")
+                if not data:
+                    raise ConnectionError("Server closed connection.")
+                buffer += data
+                messages, buffer = protocol.parse_stream_buffer(buffer)
+                if messages:
+                    reply_msg = messages[0]
+                    break
+
+            log(f"Received <{reply_msg['client_id']}, {reply_msg['replica_id']}, {reply_msg['request_num']}, reply>", Colors.REPLY)
+            self.request_num += 1
+            return True
+
+        except (socket.timeout, ConnectionError, OSError):
+            log(f"<{self.client_id}, {target_replica}, {self.request_num}, request failed: Connection lost>", Colors.FAILURE)
+            sock.close()
+            if target_replica in self.server_sockets:
+                del self.server_sockets[target_replica]
+            return False
 
     def run_interactive_or_loop(self, loop: bool = False, delay: float = 2.0):
         """
@@ -76,7 +94,6 @@ class Client:
           - loop (bool): Enable continuous request transmission.
           - delay (float): Interval in seconds between requests in loop mode.
         """
-        self.connect()
         try:
             if loop:
                 log(f"Starting continuous request loop with delay {delay}s...", Colors.RESET)
@@ -89,10 +106,10 @@ class Client:
                     if user_input.lower() == 'q':
                         break
                     self.send_request("S1", "ADD", 1)
-        except (KeyboardInterrupt, ConnectionResetError, BrokenPipeError):
-            log(f"Client {self.client_id} disconnected.", Colors.FAILURE)
+        except KeyboardInterrupt:
+            log(f"Client {self.client_id} disconnected.", Colors.RESET)
         finally:
-            for sock in self.server_sockets.values():
+            for sock in list(self.server_sockets.values()):
                 sock.close()
 
 def main():

@@ -35,48 +35,49 @@ class LocalFaultDetector:
           4. Catches socket.timeout, ConnectionResetError, or BrokenPipeError on server crash, 
              logs failure message, and terminates loop.
         """
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        # Timeout configured to twice the heartbeat frequency to allow processing window
-        sock.settimeout(self.heartbeat_freq * 2.0)
+        log(f"{self.lfd_id} running. Monitoring S1 at {self.server_host}:{self.server_port}...", Colors.RESET)
+        while True:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            # Timeout configured to twice the heartbeat frequency to allow processing window
+            sock.settimeout(self.heartbeat_freq * 2.0)
 
-        try:
-            sock.connect((self.server_host, self.server_port))
-            log(f"{self.lfd_id} connected to S1 at {self.server_host}:{self.server_port} with frequency {int(self.heartbeat_freq * 1000)}ms", Colors.RESET)
-        except Exception as e:
-            log(f"{self.lfd_id} failed to connect to S1: {e}", Colors.FAILURE)
-            return
+            try:
+                sock.connect((self.server_host, self.server_port))
+                log(f"{self.lfd_id} connected to S1 at {self.server_host}:{self.server_port} with frequency {int(self.heartbeat_freq * 1000)}ms", Colors.RESET)
 
-        buffer = ""
-        try:
-            while True:
-                hb_msg = protocol.build_heartbeat(self.lfd_id, "S1", self.heartbeat_count)
-                log(f"[{self.heartbeat_count}] {self.lfd_id} sending heartbeat to S1", Colors.HEARTBEAT)
-                
-                sock.sendall(protocol.encode_message(hb_msg))
+                buffer = ""
+                while True:
+                    hb_msg = protocol.build_heartbeat(self.lfd_id, "S1", self.heartbeat_count)
+                    log(f"[{self.heartbeat_count}] {self.lfd_id} sending heartbeat to S1", Colors.HEARTBEAT)
+                    
+                    sock.sendall(protocol.encode_message(hb_msg))
 
-                # Read response
-                received_ack = False
-                while not received_ack:
-                    data = sock.recv(1024).decode("utf-8")
-                    if not data:
-                        raise ConnectionResetError("S1 closed connection.")
-                    buffer += data
-                    messages, buffer = protocol.parse_stream_buffer(buffer)
-                    for msg in messages:
-                        if msg.get("msg_type") == "ALIVE":
-                            log(f"[{self.heartbeat_count}] {self.lfd_id} received heartbeat ACK from S1", Colors.HEARTBEAT)
-                            received_ack = True
-                            break
+                    # Read response
+                    received_ack = False
+                    while not received_ack:
+                        data = sock.recv(1024).decode("utf-8")
+                        if not data:
+                            raise ConnectionError("S1 closed connection.")
+                        buffer += data
+                        messages, buffer = protocol.parse_stream_buffer(buffer)
+                        for msg in messages:
+                            if msg.get("msg_type") == "ALIVE":
+                                log(f"[{self.heartbeat_count}] {self.lfd_id} received heartbeat ACK from S1", Colors.HEARTBEAT)
+                                received_ack = True
+                                break
 
-                self.heartbeat_count += 1
+                    self.heartbeat_count += 1
+                    time.sleep(self.heartbeat_freq)
+
+            except (socket.timeout, ConnectionError, BrokenPipeError, OSError):
+                log(f"S1 has died. Heartbeat timeout/disconnection detected at {self.lfd_id}.", Colors.FAILURE)
+            except KeyboardInterrupt:
+                log(f"{self.lfd_id} terminated manually.", Colors.RESET)
+                sock.close()
+                break
+            finally:
+                sock.close()
                 time.sleep(self.heartbeat_freq)
-
-        except (socket.timeout, ConnectionResetError, BrokenPipeError):
-            log(f"S1 has died. Heartbeat timeout expiration detected at {self.lfd_id}.", Colors.FAILURE)
-        except KeyboardInterrupt:
-            log(f"{self.lfd_id} terminated manually.", Colors.RESET)
-        finally:
-            sock.close()
 
 def main():
     parser = argparse.ArgumentParser(description="18-749 Local Fault Detector")
