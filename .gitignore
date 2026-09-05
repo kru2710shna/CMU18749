@@ -1,0 +1,12 @@
+# Virtual environment
+.venv/
+venv/
+
+# Python bytecode/caches
+__pycache__/
+*.pyc
+
+# Editor/OS cruft
+.DS_Store
+.vscode/
+.idea/
