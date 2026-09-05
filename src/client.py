@@ -49,30 +49,41 @@ class Client:
         # Explain the very small user interface used for Milestone 1 manual requests.
         print("Enter an integer to add to S1's counter, or enter q to quit.", flush=True)
 
-        while True:
-            try:
-                # Read one line from this client's own terminal.
-                raw_input = input(f"{self.client_id} amount> ").strip()
-            except EOFError:
-                # End cleanly if the terminal input stream is closed.
-                log(self.client_id, "input closed; stopping client")
-                return
+        try:
+            while True:
+                try:
+                    # Read one line from this client's own terminal.
+                    raw_input = input(f"{self.client_id} amount> ").strip()
+                except EOFError:
+                    # End cleanly if the terminal input stream is closed.
+                    log(self.client_id, "input closed; stopping client")
+                    return
 
-            # Let the user exit this client process without affecting C2/C3/S1/LFD1.
-            if raw_input.lower() in {"q", "quit", "exit"}:
-                log(self.client_id, "stopping client")
-                return
+                # Explain a blank Enter press without treating it as a mysterious integer error.
+                if not raw_input:
+                    print("No amount entered. Please enter an integer, q, quit, or exit.", flush=True)
+                    continue
 
-            try:
-                # Convert the user's text into the integer increment S1 should apply.
-                amount = int(raw_input)
-            except ValueError:
-                # Keep this client alive if the user types a non-integer value.
-                print("Please enter an integer, q, quit, or exit.", flush=True)
-                continue
+                # Let the user exit this client process without affecting C2/C3/S1/LFD1.
+                if raw_input.lower() in {"q", "quit", "exit"}:
+                    log(self.client_id, "stopping client")
+                    return
 
-            # Send exactly one numbered request and display S1's response.
-            self._send_add_request(amount)
+                try:
+                    # Convert the user's text into the integer increment S1 should apply.
+                    amount = int(raw_input)
+                except ValueError:
+                    # Keep this client alive if the user types a non-integer value.
+                    print("Please enter an integer, q, quit, or exit.", flush=True)
+                    continue
+
+                # Send exactly one numbered request and display S1's response.
+                self._send_add_request(amount)
+        except KeyboardInterrupt:
+            # Ctrl-C is an intentional user action, not a programming failure.
+            print()
+            log(self.client_id, "received Ctrl-C; stopping client cleanly")
+            return
 
     def _send_add_request(self, amount: int) -> None:
         """Send one ADD request to S1 and validate the matching reply."""
@@ -128,9 +139,42 @@ class Client:
 
             # Advance only after a successful request/reply exchange.
             self.request_num += 1
-        except (OSError, ProtocolError, ValueError) as error:
-            # Keep the client process alive if S1 is unavailable or a message is malformed.
-            log(self.client_id, f"request {current_request_num} failed: {error}")
+        except ConnectionRefusedError:
+            # This means no process is listening at the configured host and port.
+            log(
+                self.client_id,
+                f"request {current_request_num} was not sent: {self.replica_id} at "
+                f"{self.server_host}:{self.server_port} refused the connection. "
+                "Is the server running?",
+            )
+        except socket.timeout:
+            # The client cannot know whether S1 processed a request when the reply times out.
+            log(
+                self.client_id,
+                f"request {current_request_num} received no reply from {self.replica_id} "
+                f"within {int(self.timeout_seconds * 1000)} ms; the request is unconfirmed.",
+            )
+        except ConnectionResetError:
+            # A crash can close an already-open connection while the client waits for a reply.
+            log(
+                self.client_id,
+                f"request {current_request_num} lost its connection to {self.replica_id}; "
+                "the server may have stopped. The request is unconfirmed.",
+            )
+        except (ProtocolError, ValueError) as error:
+            # This includes a server that closes the socket before returning a complete reply.
+            log(
+                self.client_id,
+                f"request {current_request_num} did not receive a usable reply from "
+                f"{self.replica_id}: {error}. The request is unconfirmed.",
+            )
+        except OSError as error:
+            # Keep the client alive for other network errors, while identifying the endpoint.
+            log(
+                self.client_id,
+                f"request {current_request_num} could not communicate with {self.replica_id} "
+                f"at {self.server_host}:{self.server_port}: {error}",
+            )
 
 
 def parse_arguments() -> argparse.Namespace:
