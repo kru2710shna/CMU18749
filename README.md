@@ -15,6 +15,10 @@ S1 replies with STATE 1
 
 The project is demonstrated through terminal output. No website, database, Docker configuration, or cloud deployment is required for Milestone 1.
 
+## Status
+
+**Milestone 1 is implemented and verified** (single-laptop and two-laptop demos, including killing S1 mid-demo). See [AGENT_CONTEXT.md](AGENT_CONTEXT.md) for implementation details, design decisions, and bugs found/fixed during testing.
+
 ## Milestone 1
 
 ### Goals
@@ -42,19 +46,19 @@ flowchart LR
 
 ### Required behavior
 
-- [ ] S1 listens for TCP connections.
-- [ ] C1, C2, and C3 each send requests to S1.
-- [ ] S1 changes `my_state` when it receives a client request.
-- [ ] Each client prints sent requests and received replies.
-- [ ] S1 prints received requests, sent replies, and `my_state` before processing and before replying.
-- [ ] LFD1 sends a heartbeat to S1 repeatedly.
-- [ ] LFD1 maintains and prints `heartbeat_count`.
-- [ ] `heartbeat_freq` is configurable through a command-line argument and is not hard-coded.
-- [ ] S1 prints heartbeat receipt and its alive reply.
-- [ ] After S1 is killed with `Ctrl-C`, LFD1 prints a failed-heartbeat/timeout message.
-- [ ] Restart the system using a different heartbeat frequency and repeat the demonstration.
+- [x] S1 listens for TCP connections.
+- [x] C1, C2, and C3 each send requests to S1.
+- [x] S1 changes `my_state` when it receives a client request.
+- [x] Each client prints sent requests and received replies.
+- [x] S1 prints received requests, sent replies, and `my_state` before processing and before replying.
+- [x] LFD1 sends a heartbeat to S1 repeatedly.
+- [x] LFD1 maintains and prints `heartbeat_count`.
+- [x] `heartbeat_freq` is configurable through a command-line argument and is not hard-coded.
+- [x] S1 prints heartbeat receipt and its alive reply.
+- [x] After S1 is killed with `Ctrl-C`, LFD1 prints a failed-heartbeat/timeout message.
+- [x] Restart the system using a different heartbeat frequency and repeat the demonstration.
 
-Manual client requests are allowed for Milestone 1. A continuous request loop is optional but useful for the demo.
+Clients support both modes: `--mode auto` (default, sends on a timer in a loop) and `--mode manual` (prompts for each request from the keyboard).
 
 ### Message and logging conventions
 
@@ -87,7 +91,7 @@ time        - heartbeat scheduling
 datetime    - timestamped logs
 ```
 
-Recommended project structure:
+Actual project structure:
 
 ```text
 project/
@@ -96,31 +100,43 @@ project/
     client.py
     local_fault_detector.py
     protocol.py
+    net_utils.py
     log_utils.py
+  run_demo.sh
   README.md
+  AGENT_CONTEXT.md
 ```
 
 | File | Responsibility |
 | --- | --- |
 | `server_replica.py` | Runs S1, owns `my_state`, handles requests, replies, and heartbeat responses. |
-| `client.py` | Runs as C1, C2, or C3 depending on command-line arguments. |
+| `client.py` | Runs as C1, C2, or C3 depending on command-line arguments. Supports `--mode auto`/`manual`. |
 | `local_fault_detector.py` | Runs LFD1, sends periodic heartbeats, and reports timeout failures. |
 | `protocol.py` | Creates and parses request, reply, heartbeat, and alive messages. |
-| `log_utils.py` | Provides consistent timestamped terminal logging. |
+| `net_utils.py` | Reusable TCP server/client socket helpers, shared by every process. |
+| `log_utils.py` | Provides consistent timestamped, color-coded terminal logging. |
+| `run_demo.sh` | Launches S1, LFD1, C1, C2, C3 in one tmux window (single-laptop demo). |
 
 ### Development mode: one laptop
 
-Use five VS Code integrated terminals or five normal terminal windows:
+Fastest option — run the tmux demo script from the repo root (opens all 5 processes in one window):
+
+```text
+./run_demo.sh          # heartbeat_freq defaults to 1 second
+./run_demo.sh 0.5      # re-demo with a different heartbeat_freq
+```
+
+Or run manually in five terminals:
 
 ```text
 Terminal 1: python3 src/server_replica.py --replica-id S1 --host 0.0.0.0 --port 5000
-Terminal 2: python3 src/local_fault_detector.py --lfd-id LFD1 --server-host localhost --server-port 5000 --heartbeat-freq-ms 1000
+Terminal 2: python3 src/local_fault_detector.py --lfd-id LFD1 --replica-id S1 --server-host localhost --server-port 5000 --heartbeat-freq 1
 Terminal 3: python3 src/client.py --client-id C1 --server-host localhost --server-port 5000
 Terminal 4: python3 src/client.py --client-id C2 --server-host localhost --server-port 5000
 Terminal 5: python3 src/client.py --client-id C3 --server-host localhost --server-port 5000
 ```
 
-For local testing, all processes can connect to `localhost:5000`.
+`--heartbeat-freq` is in seconds and required (no hard-coded default). For local testing, all processes connect to `localhost:5000`.
 
 ### Demo mode: two machines
 
