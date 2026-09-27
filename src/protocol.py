@@ -16,6 +16,13 @@ suggested convention in the assignment:
     REPLY|<client_id>|<replica_id>|<request_num>|<op>|<value>
     HEARTBEAT|<lfd_id>|<replica_id>|<heartbeat_count>
     ALIVE|<replica_id>|<lfd_id>|<heartbeat_count>
+
+Milestone 2 adds the LFD<->GFD channel and membership-change notices,
+following the same "one shared set of functions" pattern:
+    GFD_HELLO|<lfd_id>|<heartbeat_count>
+    GFD_ACK|<lfd_id>|<heartbeat_count>
+    MEMBER_ADD|<lfd_id>|<replica_id>
+    MEMBER_DELETE|<lfd_id>|<replica_id>
 """
 
 import socket
@@ -25,6 +32,10 @@ REQUEST = "REQUEST"
 REPLY = "REPLY"
 HEARTBEAT = "HEARTBEAT"
 ALIVE = "ALIVE"
+GFD_HELLO = "GFD_HELLO"
+GFD_ACK = "GFD_ACK"
+MEMBER_ADD = "MEMBER_ADD"
+MEMBER_DELETE = "MEMBER_DELETE"
 
 _DELIMITER = "|"
 _ENCODING = "utf-8"
@@ -51,6 +62,43 @@ def build_heartbeat(lfd_id: str, replica_id: str, heartbeat_count: int) -> str:
 def build_alive(replica_id: str, lfd_id: str, heartbeat_count: int) -> str:
     """Build an ALIVE line, a replica's response to a heartbeat."""
     fields = [ALIVE, replica_id, lfd_id, str(heartbeat_count)]
+    return _DELIMITER.join(fields)
+
+
+def build_gfd_hello(lfd_id: str, heartbeat_count: int) -> str:
+    """Build a GFD_HELLO line: an LFD's heartbeat to the GFD (Milestone 2).
+
+    One connection serves both this heartbeat and the membership-change
+    messages below, per the assignment's "1 TCP/IP connection to the GFD"
+    per LFD.
+    """
+    fields = [GFD_HELLO, lfd_id, str(heartbeat_count)]
+    return _DELIMITER.join(fields)
+
+
+def build_gfd_ack(lfd_id: str, heartbeat_count: int) -> str:
+    """Build a GFD_ACK line: the GFD's response to a GFD_HELLO heartbeat."""
+    fields = [GFD_ACK, lfd_id, str(heartbeat_count)]
+    return _DELIMITER.join(fields)
+
+
+def build_member_add(lfd_id: str, replica_id: str) -> str:
+    """Build a MEMBER_ADD line: an LFD telling the GFD its replica is healthy.
+
+    Sent once, the first time an LFD's heartbeat to its replica succeeds
+    (at startup, or after the replica has been manually relaunched).
+    """
+    fields = [MEMBER_ADD, lfd_id, replica_id]
+    return _DELIMITER.join(fields)
+
+
+def build_member_delete(lfd_id: str, replica_id: str) -> str:
+    """Build a MEMBER_DELETE line: an LFD telling the GFD its replica died.
+
+    Sent once, the moment an LFD's heartbeat to its replica times out or
+    the connection drops.
+    """
+    fields = [MEMBER_DELETE, lfd_id, replica_id]
     return _DELIMITER.join(fields)
 
 
@@ -86,6 +134,18 @@ def parse_message(line: str) -> dict:
             "replica_id": fields[1],
             "lfd_id": fields[2],
             "heartbeat_count": int(fields[3]),
+        }
+    elif message_type in (GFD_HELLO, GFD_ACK):
+        return {
+            "type": message_type,
+            "lfd_id": fields[1],
+            "heartbeat_count": int(fields[2]),
+        }
+    elif message_type in (MEMBER_ADD, MEMBER_DELETE):
+        return {
+            "type": message_type,
+            "lfd_id": fields[1],
+            "replica_id": fields[2],
         }
     else:
         raise ValueError(f"Unknown message type: {message_type!r}")

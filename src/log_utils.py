@@ -16,22 +16,25 @@ from datetime import datetime
 _COLOR_CODES = {
     "reset": "\033[0m",
     "cyan": "\033[36m",     # client <-> server request/reply traffic
-    "yellow": "\033[33m",   # heartbeat traffic (LFD <-> server)
+    "yellow": "\033[33m",   # heartbeat traffic (LFD <-> server, LFD <-> GFD)
     "magenta": "\033[35m",  # state changes (my_state before/after)
     "red": "\033[31m",      # failures / timeouts - should stand out
     "green": "\033[32m",    # successful lifecycle events (startup, registration)
+    "blue": "\033[34m",     # membership changes (GFD add/remove a replica) and duplicate-reply detection
     "white": "\033[37m",    # default / uncategorized messages
 }
 
 # Message categories mapped to a color. Every call site picks one of these
 # categories instead of a raw color, so the color scheme stays consistent and
-# is easy to extend in later milestones (e.g. add "membership" or "duplicate").
+# is easy to extend in later milestones.
 CATEGORY_COLORS = {
     "request_reply": "cyan",
     "heartbeat": "yellow",
     "state": "magenta",
     "failure": "red",
     "lifecycle": "green",
+    "membership": "blue",
+    "duplicate": "blue",
     "default": "white",
 }
 
