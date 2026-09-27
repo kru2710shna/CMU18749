@@ -38,7 +38,6 @@ GFD_PORT=6000
 S1_PORT=5001
 S2_PORT=5002
 S3_PORT=5003
-REPLICAS="S1:localhost:$S1_PORT,S2:localhost:$S2_PORT,S3:localhost:$S3_PORT"
 
 if ! command -v tmux &> /dev/null; then
     echo "tmux is not installed. Install it with 'brew install tmux' and re-run this script."
@@ -75,26 +74,33 @@ tmux send-keys -t "$SESSION_NAME:s3.0" \
 sleep 0.5
 
 # LFDs started after their replicas, so the very first heartbeat has
-# something to connect to.
+# something to connect to. --replica-public-host is "localhost" here since
+# this is a single-laptop demo; on a real multi-machine run each LFD would
+# pass that machine's own LAN/Tailscale IP instead, so clients on the
+# sacred machine can actually reach it.
 tmux send-keys -t "$SESSION_NAME:s1.1" \
-    "python3 local_fault_detector.py --lfd-id LFD1 --replica-id S1 --server-host localhost --server-port $S1_PORT --heartbeat-freq $HEARTBEAT_FREQ --gfd-host localhost --gfd-port $GFD_PORT" C-m
+    "python3 local_fault_detector.py --lfd-id LFD1 --replica-id S1 --server-host localhost --server-port $S1_PORT --heartbeat-freq $HEARTBEAT_FREQ --gfd-host localhost --gfd-port $GFD_PORT --replica-public-host localhost" C-m
 tmux send-keys -t "$SESSION_NAME:s2.1" \
-    "python3 local_fault_detector.py --lfd-id LFD2 --replica-id S2 --server-host localhost --server-port $S2_PORT --heartbeat-freq $HEARTBEAT_FREQ --gfd-host localhost --gfd-port $GFD_PORT" C-m
+    "python3 local_fault_detector.py --lfd-id LFD2 --replica-id S2 --server-host localhost --server-port $S2_PORT --heartbeat-freq $HEARTBEAT_FREQ --gfd-host localhost --gfd-port $GFD_PORT --replica-public-host localhost" C-m
 tmux send-keys -t "$SESSION_NAME:s3.1" \
-    "python3 local_fault_detector.py --lfd-id LFD3 --replica-id S3 --server-host localhost --server-port $S3_PORT --heartbeat-freq $HEARTBEAT_FREQ --gfd-host localhost --gfd-port $GFD_PORT" C-m
+    "python3 local_fault_detector.py --lfd-id LFD3 --replica-id S3 --server-host localhost --server-port $S3_PORT --heartbeat-freq $HEARTBEAT_FREQ --gfd-host localhost --gfd-port $GFD_PORT --replica-public-host localhost" C-m
 sleep 1
 
 # --- window 4: C1 | C2 | C3 ---
+# Clients learn replica membership dynamically from the GFD (--gfd-host/
+# --gfd-port), per the Milestone 2 rubric, rather than a static --replicas
+# list - the GFD pushes an initial snapshot on connect, then a fresh one
+# on every add/delete.
 tmux new-window -t "$SESSION_NAME" -n clients -c "$SRC_DIR"
 tmux split-window -h -t "$SESSION_NAME:clients" -c "$SRC_DIR"
 tmux split-window -h -t "$SESSION_NAME:clients" -c "$SRC_DIR"
 tmux select-layout -t "$SESSION_NAME:clients" even-horizontal
 tmux send-keys -t "$SESSION_NAME:clients.0" \
-    "python3 client.py --client-id C1 --replicas $REPLICAS" C-m
+    "python3 client.py --client-id C1 --gfd-host localhost --gfd-port $GFD_PORT" C-m
 tmux send-keys -t "$SESSION_NAME:clients.1" \
-    "python3 client.py --client-id C2 --replicas $REPLICAS" C-m
+    "python3 client.py --client-id C2 --gfd-host localhost --gfd-port $GFD_PORT" C-m
 tmux send-keys -t "$SESSION_NAME:clients.2" \
-    "python3 client.py --client-id C3 --replicas $REPLICAS" C-m
+    "python3 client.py --client-id C3 --gfd-host localhost --gfd-port $GFD_PORT" C-m
 
 tmux select-window -t "$SESSION_NAME:gfd"
 

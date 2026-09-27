@@ -147,12 +147,25 @@ them now would be scope creep against the M1 rubric.
 ## Status: Milestone 2 is complete and verified
 
 All rubric items (GFD startup/membership printing, LFD↔GFD registration and
-heartbeating, membership add/delete on replica up/down, 3-way client fanout,
-duplicate-reply detection, continued operation after a single replica is
-killed) have been implemented and verified end-to-end on one laptop (GFD + 3×
-(replica+LFD) + 3 clients, ports 6000/5001/5002/5003), including killing S1
-mid-demo and confirming the client kept going on S2/S3 alone while the GFD's
-membership count dropped to 2.
+heartbeating, membership add/delete on replica up/down, GFD→client membership
+broadcast, 3-way client fanout, duplicate-reply detection, continued operation
+after a single replica is killed) have been implemented and verified
+end-to-end on one laptop (GFD + 3× (replica+LFD) + 3 clients, ports
+6000/5001/5002/5003), including killing S1 mid-demo and confirming the client
+kept going on S2/S3 alone while the GFD's membership count dropped to 2 and
+pushed that update to the client live.
+
+**Revision note:** the project guide PDF was updated mid-implementation to add
+a requirement that wasn't in the original version: clients must learn replica
+membership *dynamically from the GFD* (register once, get pushed a fresh
+`MEMBERSHIP` snapshot on every add/delete) rather than being told a static
+replica list on the command line. The original implementation (client learns
+replicas from a static `--replicas` CLI arg, GFD only tracks membership for
+its own console printing) was extended - not replaced - to add this: `gfd.py`
+now also accepts client registrations and broadcasts membership, and
+`client.py` gained a `--gfd-host`/`--gfd-port` mode that supersedes
+`--replicas` as the rubric-required path. `--replicas` is kept as a
+static/offline testing alternative that bypasses the GFD entirely.
 
 ## Guiding constraint for M2: additive only
 
@@ -166,17 +179,18 @@ design - only build on top of it.** Concretely, that meant:
   Tricks ("You can use the same server code for both active replication and
   passive replication").
 - `local_fault_detector.py` and `client.py` gained new, **opt-in** code paths
-  (`--gfd-host`/`--gfd-port` on the LFD; `--replicas` on the client) rather
-  than being rewritten. Omitting the new flags reproduces exact Milestone 1
-  behavior - verified directly (see "Bugs found and fixed" below has no new
-  entries from this regression check; a live side-by-side run of
+  (`--gfd-host`/`--gfd-port`/`--replica-public-host` on the LFD; `--gfd-host`/
+  `--gfd-port` on the client, with `--replicas` kept as a static fallback)
+  rather than being rewritten. Omitting the new flags reproduces exact
+  Milestone 1 behavior - verified directly (see "Bugs found and fixed" below
+  has no new entries from this regression check; a live side-by-side run of
   `local_fault_detector.py`/`client.py` with and without the new flags showed
   byte-identical M1-mode log output).
 - `protocol.py` only gained new `build_*`/`parse_message` branches
-  (`GFD_HELLO`/`GFD_ACK`/`MEMBER_ADD`/`MEMBER_DELETE`); every M1 message type
-  is untouched. This was already the file's own stated design intent (see its
-  module docstring from M1: "adding a new field or message type later means
-  editing this file only").
+  (`GFD_HELLO`/`GFD_ACK`/`MEMBER_ADD`/`MEMBER_DELETE`/`CLIENT_HELLO`/
+  `MEMBERSHIP`); every M1 message type is untouched. This was already the
+  file's own stated design intent (see its module docstring from M1: "adding
+  a new field or message type later means editing this file only").
 - `log_utils.py` only gained one new category (`membership`/`duplicate` →
   blue); all M1 categories/colors are untouched.
 - `run_demo.sh` (M1) was left completely alone. A new `run_demo_m2.sh` handles
@@ -187,8 +201,18 @@ design - only build on top of it.** Concretely, that meant:
 - **LFD↔GFD wire messages** (`protocol.py`): `GFD_HELLO`/`GFD_ACK` mirror the
   existing `HEARTBEAT`/`ALIVE` pair exactly (same register-then-heartbeat
   pattern, one level up the hierarchy - this was anticipated in the M1
-  `local_fault_detector.py` docstring). `MEMBER_ADD`/`MEMBER_DELETE` carry
-  just `(lfd_id, replica_id)`.
+  `local_fault_detector.py` docstring). `MEMBER_ADD` carries
+  `(lfd_id, replica_id, public_host, public_port)` - the host/port fields were
+  added for the GFD→client broadcast requirement, since the GFD needs
+  somewhere to reach the replica *from a different machine* than the LFD's
+  own `localhost` view of it. `MEMBER_DELETE` only needs `(lfd_id, replica_id)`.
+- **GFD↔client wire messages** (`protocol.py`, new): `CLIENT_HELLO` is a
+  client registering (mirrors `GFD_HELLO`'s register-then-listen pattern, one
+  level further out); `MEMBERSHIP` is always a *full* snapshot
+  (`replica_id:host:port,...`), never an incremental delta, sent once on
+  registration and again on every subsequent add/delete - a client that
+  missed one broadcast is still correct after the next one, so there's no
+  need for acks or sequence numbers on this channel.
 - **One connection per LFD→GFD, multiplexed** (`local_fault_detector.py`):
   per the assignment ("1 TCP/IP connection to the GFD"), the LFD opens exactly
   one persistent socket to the GFD at startup. Two things write to it
@@ -206,11 +230,43 @@ design - only build on top of it.** Concretely, that meant:
   The assignment's rubric for M2 never tests independent GFD heartbeat
   tuning - that's listed only as a later "dynamic reconfiguration" property,
   out of scope here per the user's instructions to stay within M2.
-- **GFD membership is an ordered list, not a set** (`gfd.py`): printed order
-  matches join order (e.g. "GFD: 2 members: S1, S2"), matching every example
-  in the assignment PDF. Guarded by a `threading.Lock` since multiple LFD
-  connections (one thread each, via `net_utils.start_tcp_server`) can send
-  `MEMBER_ADD`/`MEMBER_DELETE` concurrently.
+- **GFD membership is a dict (`replica_id -> (host, port)`), not a set/list**
+  (`gfd.py`): needs to carry connection info per replica (for the client
+  broadcast), and Python dicts preserve insertion order, so printed order
+  still matches join order (e.g. "GFD: 2 members: S1, S2") exactly as every
+  example in the assignment PDF shows. Guarded by a `threading.Lock` since
+  multiple LFD connections (one thread each, via `net_utils.start_tcp_server`)
+  can send `MEMBER_ADD`/`MEMBER_DELETE` concurrently.
+- **GFD tracks connected clients in a list, broadcasts on every membership
+  change** (`gfd.py`): a client's connection is added to `self._clients` on
+  `CLIENT_HELLO` and removed (in a `finally`) when its per-connection thread's
+  `receive_line()` returns empty (disconnect). `_handle_member_add`/
+  `_handle_member_delete` both call a shared `_broadcast_membership()` after
+  updating `self.membership`, which sends the *same* full snapshot to every
+  connected client - reusing one code path for "initial snapshot on hello"
+  and "update on change" (the hello handler just calls the same
+  snapshot-building logic once, to just that one new connection).
+- **Client-side live connection registry: `ReplicaSet`** (`client.py`): a
+  small thread-safe class wrapping `{replica_id: [sock, alive]}`, because two
+  different things now mutate/read it concurrently in GFD mode - the main
+  request loop (reads a snapshot each round, marks an entry dead on
+  send/recv failure) and a background `_gfd_listener_thread` (opens/closes
+  connections whenever a fresh `MEMBERSHIP` snapshot arrives). The request
+  loop itself (`_run_multireplica_request_loop`) was extracted out of the old
+  `run_client_multireplica` so both the static `--replicas` path and the new
+  `--gfd-host` path share the exact same fan-out/dedup logic - only how the
+  `ReplicaSet` gets populated (once, vs. continuously from a listener thread)
+  differs between the two.
+- **Two independent layers detect a dead replica, deliberately**: the
+  client's own per-round send/recv (marks a replica dead the instant its
+  socket errors, so traffic never pauses waiting for the GFD) and the GFD's
+  broadcast (arrives moments later via LFD→GFD→client, and is authoritative -
+  it's what actually closes/removes the now-redundant connection). Verified
+  live: killing S1 first produced `request_num N: no reply from S1 (...);
+  marking it down.` from the client's own detection, then ~250ms later
+  `Received membership update from GFD: 2 member(s): S3, S2` /
+  `Replica S1 left membership; connection closed.` from the broadcast - both
+  expected, neither redundant.
 - **Client fanout is round-based with a bounded per-reply wait**
   (`client.py`, `run_client_multireplica`): for `request_num` N, the client
   sends to all live replicas back-to-back *before* reading any reply back
@@ -247,23 +303,35 @@ design - only build on top of it.** Concretely, that meant:
 
 For the real multi-machine demo, see the "Running Milestone 2" section of
 [README.md](README.md) - GFD runs on the sacred/client machine, each
-replica+LFD pair runs on its own non-sacred machine, and the client's
-`--replicas` flag takes a comma-separated `replica_id:host:port` list.
+replica+LFD pair runs on its own non-sacred machine (each LFD needs
+`--replica-public-host <that machine's own LAN/Tailscale IP>`), and each
+client just needs `--gfd-host`/`--gfd-port` pointed at the sacred machine -
+no replica addresses required on the client's command line at all.
 
 ## What was verified live for M2
 
 Using the ports above on one laptop: GFD started and printed `GFD: 0
-members`; S1/S2/S3 + LFD1/2/3 came up and GFD's membership grew to `GFD: 3
-members: ...` as each LFD's first heartbeat to its replica succeeded; a
-client with `--replicas` connected to all three, sent request_num 1-3 to all
-three back-to-back, and correctly delivered exactly one reply per round while
-discarding the other two as duplicates. Then S1 was `kill -9`'d mid-run: the
-client's very next round got a `Connection reset by peer` from S1 (logged,
-S1 marked down), continued delivering from S2 with S3's reply discarded as a
-duplicate, and never paused. Simultaneously, LFD1 logged `Heartbeat to S1
+members`; S1/S2/S3 + LFD1/2/3 came up (each with `--replica-public-host
+localhost`) and GFD's membership grew to `GFD: 3 members: ...` as each LFD's
+first heartbeat to its replica succeeded. A client with `--gfd-host`/
+`--gfd-port` sent `CLIENT_HELLO`, received `Received initial membership from
+GFD: 3 member(s): S1, S3, S2`, opened all three connections itself from that
+snapshot, then sent request_num 1-3 to all three back-to-back and correctly
+delivered exactly one reply per round while discarding the other two as
+duplicates.
+
+Then S1 was `kill -9`'d mid-run: the client's very next round got a
+`Connection reset by peer` from S1 (logged, S1 marked down locally,
+traffic continued uninterrupted on S2/S3), and ~250ms later the client
+logged `Received membership update from GFD: 2 member(s): S3, S2` followed by
+`Replica S1 left membership; connection closed.` - the GFD's push arriving
+and being applied live, on top of (not instead of) the client's own
+immediate local detection. Simultaneously, LFD1 logged `Heartbeat to S1
 FAILED/TIMED OUT ... Replica presumed crashed`, sent `LFD1: delete replica
-S1` to the GFD, and the GFD printed `GFD: 2 members: S2, S3` - all exactly
-matching the rubric's expected console text.
+S1` to the GFD, and the GFD printed `GFD: 2 members: S2, S3` and logged
+`Sent updated membership snapshot (2 member(s)) to 1 connected client(s)` -
+all exactly matching the rubric's expected console text and the new
+GFD-to-client requirement.
 
 ## Explicitly out of scope for M2 (do not add yet)
 

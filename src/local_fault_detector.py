@@ -116,7 +116,7 @@ def run_gfd_heartbeat_loop(lfd_id: str, gfd_link: GFDLink, heartbeat_freq_sec: f
         time.sleep(heartbeat_freq_sec)
 
 
-def run_local_fault_detector(lfd_id: str, replica_id: str, server_host: str, server_port: int, heartbeat_freq_sec: float, gfd_link: GFDLink = None) -> None:
+def run_local_fault_detector(lfd_id: str, replica_id: str, server_host: str, server_port: int, heartbeat_freq_sec: float, gfd_link: GFDLink = None, replica_public_host: str = None) -> None:
     heartbeat_count = 1
     timeout_sec = heartbeat_freq_sec * _TIMEOUT_MULTIPLIER
     # Tracks whether the GFD currently believes this replica is a member,
@@ -172,7 +172,7 @@ def run_local_fault_detector(lfd_id: str, replica_id: str, server_host: str, ser
                     # replica last failed: tell the GFD this replica just
                     # became (or became again) a healthy member.
                     if gfd_link is not None and not registered_with_gfd:
-                        gfd_link.send_line(protocol.build_member_add(lfd_id, replica_id))
+                        gfd_link.send_line(protocol.build_member_add(lfd_id, replica_id, replica_public_host, server_port))
                         log_utils.log(lfd_id, f"{lfd_id}: add replica {replica_id}", category="membership")
                         registered_with_gfd = True
 
@@ -222,10 +222,22 @@ def main() -> None:
         default=None,
         help="Port of the GFD (Milestone 2). Omit together with --gfd-host for Milestone-1 mode.",
     )
+    parser.add_argument(
+        "--replica-public-host",
+        default=None,
+        help="Milestone 2, required with --gfd-host/--gfd-port: the host/IP that OTHER machines "
+             "(clients, on the sacred machine) should use to reach this LFD's replica - i.e. this "
+             "machine's own LAN/Tailscale IP, or 'localhost' for a single-laptop demo. Distinct from "
+             "--server-host, which is how the LFD itself reaches its co-located replica (normally "
+             "'localhost') and is never sent anywhere.",
+    )
     args = parser.parse_args()
 
     gfd_link = None
     if args.gfd_host is not None and args.gfd_port is not None:
+        if args.replica_public_host is None:
+            raise SystemExit("--replica-public-host is required when --gfd-host/--gfd-port are given, "
+                              "so clients on the sacred machine know where to reach this replica.")
         gfd_link = _connect_to_gfd(args.lfd_id, args.gfd_host, args.gfd_port)
         gfd_thread = threading.Thread(
             target=run_gfd_heartbeat_loop,
@@ -236,7 +248,7 @@ def main() -> None:
     elif args.gfd_host is not None or args.gfd_port is not None:
         raise SystemExit("--gfd-host and --gfd-port must be supplied together (or not at all).")
 
-    run_local_fault_detector(args.lfd_id, args.replica_id, args.server_host, args.server_port, args.heartbeat_freq, gfd_link)
+    run_local_fault_detector(args.lfd_id, args.replica_id, args.server_host, args.server_port, args.heartbeat_freq, gfd_link, args.replica_public_host)
 
 
 if __name__ == "__main__":

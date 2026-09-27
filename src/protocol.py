@@ -21,8 +21,16 @@ Milestone 2 adds the LFD<->GFD channel and membership-change notices,
 following the same "one shared set of functions" pattern:
     GFD_HELLO|<lfd_id>|<heartbeat_count>
     GFD_ACK|<lfd_id>|<heartbeat_count>
-    MEMBER_ADD|<lfd_id>|<replica_id>
+    MEMBER_ADD|<lfd_id>|<replica_id>|<public_host>|<public_port>
     MEMBER_DELETE|<lfd_id>|<replica_id>
+
+The updated Milestone 2 spec additionally requires clients to learn
+membership from the GFD (rather than being told a static replica list on
+the command line), and for the GFD to push every membership change to
+every connected client. Same pattern again, one level of the hierarchy
+further out:
+    CLIENT_HELLO|<client_id>
+    MEMBERSHIP|<replica_id>:<host>:<port>,<replica_id>:<host>:<port>,...
 """
 
 import socket
@@ -36,6 +44,8 @@ GFD_HELLO = "GFD_HELLO"
 GFD_ACK = "GFD_ACK"
 MEMBER_ADD = "MEMBER_ADD"
 MEMBER_DELETE = "MEMBER_DELETE"
+CLIENT_HELLO = "CLIENT_HELLO"
+MEMBERSHIP = "MEMBERSHIP"
 
 _DELIMITER = "|"
 _ENCODING = "utf-8"
@@ -82,13 +92,17 @@ def build_gfd_ack(lfd_id: str, heartbeat_count: int) -> str:
     return _DELIMITER.join(fields)
 
 
-def build_member_add(lfd_id: str, replica_id: str) -> str:
+def build_member_add(lfd_id: str, replica_id: str, public_host: str, public_port: int) -> str:
     """Build a MEMBER_ADD line: an LFD telling the GFD its replica is healthy.
 
     Sent once, the first time an LFD's heartbeat to its replica succeeds
     (at startup, or after the replica has been manually relaunched).
+    Carries the replica's publicly-reachable host/port (distinct from the
+    LFD's own --server-host, which is normally "localhost" since the LFD
+    and its replica are co-located) so the GFD can relay it on to clients,
+    which run on a different, sacred machine.
     """
-    fields = [MEMBER_ADD, lfd_id, replica_id]
+    fields = [MEMBER_ADD, lfd_id, replica_id, public_host, str(public_port)]
     return _DELIMITER.join(fields)
 
 
@@ -100,6 +114,26 @@ def build_member_delete(lfd_id: str, replica_id: str) -> str:
     """
     fields = [MEMBER_DELETE, lfd_id, replica_id]
     return _DELIMITER.join(fields)
+
+
+def build_client_hello(client_id: str) -> str:
+    """Build a CLIENT_HELLO line: a client registering with the GFD so it
+    can learn (and be kept up to date on) the current replica membership."""
+    fields = [CLIENT_HELLO, client_id]
+    return _DELIMITER.join(fields)
+
+
+def build_membership(members) -> str:
+    """Build a MEMBERSHIP line: the GFD's full current-membership snapshot,
+    sent to a client once at registration and again on every subsequent
+    membership change. `members` is an iterable of (replica_id, host, port).
+
+    Always the *full* snapshot (not an incremental add/delete) so a client
+    that missed an earlier update - or that just connected - can't drift
+    out of sync with the GFD's view of the world.
+    """
+    entries = [f"{replica_id}:{host}:{port}" for replica_id, host, port in members]
+    return _DELIMITER.join([MEMBERSHIP, ",".join(entries)])
 
 
 def parse_message(line: str) -> dict:
@@ -141,11 +175,34 @@ def parse_message(line: str) -> dict:
             "lfd_id": fields[1],
             "heartbeat_count": int(fields[2]),
         }
-    elif message_type in (MEMBER_ADD, MEMBER_DELETE):
+    elif message_type == MEMBER_ADD:
         return {
             "type": message_type,
             "lfd_id": fields[1],
             "replica_id": fields[2],
+            "public_host": fields[3],
+            "public_port": int(fields[4]),
+        }
+    elif message_type == MEMBER_DELETE:
+        return {
+            "type": message_type,
+            "lfd_id": fields[1],
+            "replica_id": fields[2],
+        }
+    elif message_type == CLIENT_HELLO:
+        return {
+            "type": message_type,
+            "client_id": fields[1],
+        }
+    elif message_type == MEMBERSHIP:
+        members = []
+        if fields[1]:
+            for entry in fields[1].split(","):
+                replica_id, host, port_str = entry.split(":")
+                members.append((replica_id, host, int(port_str)))
+        return {
+            "type": message_type,
+            "members": members,
         }
     else:
         raise ValueError(f"Unknown message type: {message_type!r}")

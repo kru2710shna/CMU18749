@@ -119,17 +119,21 @@ flowchart LR
 | Non-sacred machine 2 | S2 and LFD2 |
 | Non-sacred machine 3 | S3 and LFD3 |
 
-`server_replica.py` is unmodified from Milestone 1 - active replication needs no coordination between replicas at all, so the exact same file just runs three times as S1, S2, and S3. `local_fault_detector.py` and `client.py` are additively extended: passing `--gfd-host`/`--gfd-port` to the LFD, or `--replicas` to the client, opts into Milestone 2 behavior; omitting them reproduces Milestone 1 behavior exactly (verified - see [AGENT_CONTEXT.md](AGENT_CONTEXT.md)).
+`server_replica.py` is unmodified from Milestone 1 - active replication needs no coordination between replicas at all, so the exact same file just runs three times as S1, S2, and S3. `local_fault_detector.py` and `client.py` are additively extended: passing `--gfd-host`/`--gfd-port`/`--replica-public-host` to the LFD, or `--gfd-host`/`--gfd-port` to the client, opts into Milestone 2 behavior; omitting them reproduces Milestone 1 behavior exactly (verified - see [AGENT_CONTEXT.md](AGENT_CONTEXT.md)).
+
+Clients learn replica membership **dynamically from the GFD**, per the updated project guide, rather than from a static list: a client registers once (`CLIENT_HELLO`), the GFD immediately replies with the current membership snapshot, and pushes a fresh snapshot to every connected client each time membership changes (an LFD reports a replica added or removed). A client opens/closes replica connections live as those snapshots arrive - this is on top of (not instead of) the client's own per-round failure detection, so traffic never pauses even before the GFD's broadcast lands. (`client.py` also still accepts a static `--replicas` list as an offline/testing alternative that bypasses the GFD entirely.)
 
 ### Required behavior
 
 - [x] GFD starts up and prints `GFD: 0 members`.
 - [x] Each LFD registers with the GFD over one persistent TCP connection and heartbeats it periodically (`heartbeat_freq`, reusing the same value as the LFD's replica heartbeat).
-- [x] After an LFD's first successful heartbeat to its replica, it sends `LFD<n>: add replica S<n>` to the GFD, which updates `membership[]`/`member_count` and prints `GFD: N members: ...`.
-- [x] Each client opens a persistent TCP connection to all 3 replicas and, every round, sends the identical request to all 3 before reading any reply back.
+- [x] After an LFD's first successful heartbeat to its replica, it sends `LFD<n>: add replica S<n>` (with the replica's publicly-reachable host/port) to the GFD, which updates `membership[]`/`member_count` and prints `GFD: N members: ...`.
+- [x] Each client registers with the GFD (`CLIENT_HELLO`), receives the current membership as a `MEMBERSHIP` snapshot, and opens a persistent TCP connection to each listed replica - printed at both the GFD and the client console.
+- [x] Every time membership changes, the GFD pushes a fresh `MEMBERSHIP` snapshot to every connected client, which opens/closes connections to match - also printed at both ends.
+- [x] Every round, each client sends the identical request to every live replica before reading any reply back.
 - [x] Requests/replies to/from every replica are printed on both the client's and each replica's console.
 - [x] The client delivers the first reply for a given `request_num` and prints `request_num N: Discarded duplicate reply from S<n>` for the others.
-- [x] Killing a replica (`Ctrl-C`) makes its LFD report a failed heartbeat, send `LFD<n>: delete replica S<n>` to the GFD (which prints the updated membership), and the client continues automatically against the remaining replicas without pausing.
+- [x] Killing a replica (`Ctrl-C`) makes its LFD report a failed heartbeat, send `LFD<n>: delete replica S<n>` to the GFD (which prints the updated membership and broadcasts it to clients), and the client continues automatically against the remaining replicas without pausing.
 - [x] Clients run in a continuous automatic loop (`--mode auto`, the default) per Milestone 2's requirement (unlike Milestone 1, where manual mode was also acceptable).
 
 ### Running Milestone 2
@@ -143,7 +147,7 @@ Single laptop (all on `localhost`, for testing before the real multi-machine dem
 
 This opens one tmux window with 10 panes: GFD, then (S1, LFD1), (S2, LFD2), (S3, LFD3), then C1, C2, C3, all on `localhost` with ports GFD=6000, S1=5001, S2=5002, S3=5003.
 
-Real multi-machine demo (GFD on the sacred/client machine; one replica + its LFD per non-sacred machine):
+Real multi-machine demo (GFD on the sacred/client machine; one replica + its LFD per non-sacred machine). Each LFD needs `--replica-public-host` - the address *other* machines should use to reach its replica (its own LAN/Tailscale IP), since `--server-host localhost` is only how the LFD reaches its co-located replica:
 
 ```text
 Sacred machine:
@@ -153,14 +157,17 @@ Machine 1:
   python3 src/server_replica.py --replica-id S1 --host 0.0.0.0 --port 5000
   python3 src/local_fault_detector.py --lfd-id LFD1 --replica-id S1 \
     --server-host localhost --server-port 5000 --heartbeat-freq 1 \
-    --gfd-host <SACRED_MACHINE_IP> --gfd-port 6000
+    --gfd-host <SACRED_MACHINE_IP> --gfd-port 6000 \
+    --replica-public-host <MACHINE1_IP>
 
-Machine 2: (same, with S2/LFD2)
-Machine 3: (same, with S3/LFD3)
+Machine 2: (same, with S2/LFD2, --replica-public-host <MACHINE2_IP>)
+Machine 3: (same, with S3/LFD3, --replica-public-host <MACHINE3_IP>)
 
-Sacred machine, three more terminals (C1, C2, C3):
-  python3 src/client.py --client-id C1 \
-    --replicas "S1:<MACHINE1_IP>:5000,S2:<MACHINE2_IP>:5000,S3:<MACHINE3_IP>:5000"
+Sacred machine, three more terminals (C1, C2, C3) - each learns the
+replica list from the GFD, no need to know any replica's address directly:
+  python3 src/client.py --client-id C1 --gfd-host localhost --gfd-port 6000
+  python3 src/client.py --client-id C2 --gfd-host localhost --gfd-port 6000
+  python3 src/client.py --client-id C3 --gfd-host localhost --gfd-port 6000
 ```
 
 ## Python setup
@@ -195,10 +202,10 @@ project/
 | File | Responsibility |
 | --- | --- |
 | `server_replica.py` | Runs a server replica (S1/S2/S3), owns `my_state`, handles requests, replies, and heartbeat responses. Unchanged since Milestone 1 - active replication needs no code here. |
-| `client.py` | Runs as C1, C2, or C3. Milestone 1 mode (default): talks to one server. Milestone 2 mode (`--replicas`): fans out to all 3 replicas and discards duplicate replies. Supports `--mode auto`/`manual`. |
-| `local_fault_detector.py` | Runs an LFD (LFD1/2/3), sends periodic heartbeats to its replica, and reports timeout failures. Milestone 2 mode (`--gfd-host`/`--gfd-port`): also registers and heartbeats with the GFD, and reports membership add/delete. |
-| `gfd.py` | Milestone 2: the Global Fault Detector. Tracks `membership[]`/`member_count` and prints `GFD: N members: ...`. |
-| `protocol.py` | Creates and parses request, reply, heartbeat, alive, GFD-heartbeat, and membership-change messages. |
+| `client.py` | Runs as C1, C2, or C3. Milestone 1 mode (default): talks to one server. Milestone 2 mode (`--gfd-host`/`--gfd-port`): registers with the GFD, learns/updates replica membership dynamically, fans requests out to all live replicas, and discards duplicate replies. (`--replicas` remains as a static/offline alternative.) Supports `--mode auto`/`manual`. |
+| `local_fault_detector.py` | Runs an LFD (LFD1/2/3), sends periodic heartbeats to its replica, and reports timeout failures. Milestone 2 mode (`--gfd-host`/`--gfd-port`/`--replica-public-host`): also registers and heartbeats with the GFD, and reports membership add/delete (with the replica's public host/port). |
+| `gfd.py` | Milestone 2: the Global Fault Detector. Tracks `membership{}` (replica_id -> host/port) and `member_count`, prints `GFD: N members: ...`, and broadcasts a `MEMBERSHIP` snapshot to every connected client on registration and on every change. |
+| `protocol.py` | Creates and parses request, reply, heartbeat, alive, GFD-heartbeat, membership-change, and client-membership (`CLIENT_HELLO`/`MEMBERSHIP`) messages. |
 | `net_utils.py` | Reusable TCP server/client socket helpers, shared by every process. |
 | `log_utils.py` | Provides consistent timestamped, color-coded terminal logging. |
 | `run_demo.sh` | Launches S1, LFD1, C1, C2, C3 in one tmux window (Milestone 1, single-laptop demo). |
