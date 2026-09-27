@@ -163,12 +163,22 @@ class ReplicaSet:
 
     def sync_membership(self, members) -> None:
         """Reconcile against a fresh (replica_id, host, port) list from the
-        GFD (or the static --replicas arg): open connections to replicas
-        we don't have yet, close and drop ones no longer in the list."""
+        GFD (or the static --replicas arg): open connections to replicas we
+        don't have a *live* connection for yet (including one we previously
+        marked dead - a replica the GFD is currently reporting as a member
+        is, by definition, healthy again as far as this client is concerned,
+        even if an earlier round's send/recv failed against it), and close
+        and drop ones no longer in the list.
+
+        The blocking connect() calls happen *outside* self._lock (only the
+        bookkeeping around them is locked), so a slow/unreachable replica
+        can't stall the request loop's snapshot()/mark_dead() calls, which
+        also need this same lock.
+        """
         target_ids = {replica_id for replica_id, _host, _port in members}
+
         with self._lock:
             current_ids = set(self._entries.keys())
-
             for replica_id in current_ids - target_ids:
                 sock, _alive = self._entries.pop(replica_id)
                 try:
@@ -177,16 +187,28 @@ class ReplicaSet:
                     pass
                 log_utils.log(self.client_id, f"Replica {replica_id} left membership; connection closed.", category="membership")
 
-            for replica_id, host, port in members:
-                if replica_id in self._entries:
-                    continue
-                try:
-                    sock = net_utils.connect_to_server(host, port)
-                except OSError as error:
-                    log_utils.log(self.client_id, f"Could not connect to {replica_id} at {host}:{port}: {error}", category="failure")
-                    continue
-                log_utils.log(self.client_id, f"Connected to {replica_id} at {host}:{port}", category="lifecycle")
+        for replica_id, host, port in members:
+            with self._lock:
+                existing = self._entries.get(replica_id)
+                already_alive = existing is not None and existing[1]
+            if already_alive:
+                continue
+
+            try:
+                sock = net_utils.connect_to_server(host, port)
+            except OSError as error:
+                log_utils.log(self.client_id, f"Could not connect to {replica_id} at {host}:{port}: {error}", category="failure")
+                continue
+            log_utils.log(self.client_id, f"Connected to {replica_id} at {host}:{port}", category="lifecycle")
+
+            with self._lock:
+                old = self._entries.get(replica_id)
                 self._entries[replica_id] = [sock, True]
+            if old is not None:
+                try:
+                    old[0].close()
+                except OSError:
+                    pass
 
     def close_all(self) -> None:
         with self._lock:

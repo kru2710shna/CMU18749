@@ -49,4 +49,9 @@ def log(process_label: str, message: str, category: str = "default") -> None:
     color_name = CATEGORY_COLORS.get(category, "default")
     color_code = _COLOR_CODES[color_name]
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    print(f"{color_code}[{timestamp}] [{process_label}] {message}{_COLOR_CODES['reset']}")
+    # flush=True: stdout is only line-buffered by default when connected to
+    # a real terminal. Redirected to a file, piped, or run through an IDE's
+    # "Run Python File" button (not a real TTY), it's fully buffered instead,
+    # so lines can sit invisible for a long time (or forever, if the process
+    # is still running) without this.
+    print(f"{color_code}[{timestamp}] [{process_label}] {message}{_COLOR_CODES['reset']}", flush=True)
