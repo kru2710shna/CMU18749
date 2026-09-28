@@ -262,8 +262,13 @@ def _run_multireplica_request_loop(client_id: str, replica_set: ReplicaSet, add_
         for replica_id, sock, alive in connections:
             if not alive:
                 continue
-            sock.settimeout(reply_timeout_sec)
             try:
+                # settimeout() itself can race with the GFD-listener thread
+                # closing this exact socket (via sync_membership, if this
+                # replica left membership mid-round) - moved inside the try
+                # so that race is treated like any other per-replica
+                # failure instead of crashing the whole client.
+                sock.settimeout(reply_timeout_sec)
                 reply_line = protocol.receive_line(sock)
                 if not reply_line:
                     raise ConnectionError("Connection closed by replica")

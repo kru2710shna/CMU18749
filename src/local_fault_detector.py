@@ -48,13 +48,29 @@ class GFDLink:
     reads from this socket, so there's no equivalent need to guard reads.
     """
 
-    def __init__(self, sock: socket.socket):
+    def __init__(self, lfd_id: str, sock: socket.socket):
+        self.lfd_id = lfd_id
         self.sock = sock
         self._lock = threading.Lock()
 
     def send_line(self, line: str) -> None:
+        """Send one line to the GFD, tolerating the GFD being unreachable.
+
+        Per the assignment's own assumptions, the GFD is an acceptable
+        single point of failure. If it happens to be down or its connection
+        has dropped exactly when we try to notify it (e.g. mid-shutdown, or
+        a network blip), that should degrade to "the GFD's view of this
+        replica goes briefly stale" - not crash the LFD, whose primary job
+        (detecting and reporting on its own local replica) has nothing to
+        do with whether the GFD is currently reachable. Called from three
+        places in run_local_fault_detector(); handling it once here, rather
+        than wrapping each call site, covers all of them.
+        """
         with self._lock:
-            protocol.send_line(self.sock, line)
+            try:
+                protocol.send_line(self.sock, line)
+            except OSError as error:
+                log_utils.log(self.lfd_id, f"Could not notify GFD ({error}); continuing without it.", category="failure")
 
 
 def _connect_to_gfd(lfd_id: str, gfd_host: str, gfd_port: int) -> GFDLink:
@@ -65,7 +81,7 @@ def _connect_to_gfd(lfd_id: str, gfd_host: str, gfd_port: int) -> GFDLink:
         try:
             sock = net_utils.connect_to_server(gfd_host, gfd_port)
             log_utils.log(lfd_id, f"Connected to GFD at {gfd_host}:{gfd_port}", category="lifecycle")
-            return GFDLink(sock)
+            return GFDLink(lfd_id, sock)
         except OSError as error:
             log_utils.log(lfd_id, f"Could not connect to GFD: {error}", category="failure")
             time.sleep(1.0)
