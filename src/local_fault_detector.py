@@ -264,7 +264,17 @@ def main() -> None:
     elif args.gfd_host is not None or args.gfd_port is not None:
         raise SystemExit("--gfd-host and --gfd-port must be supplied together (or not at all).")
 
-    run_local_fault_detector(args.lfd_id, args.replica_id, args.server_host, args.server_port, args.heartbeat_freq, gfd_link, args.replica_public_host)
+    try:
+        run_local_fault_detector(args.lfd_id, args.replica_id, args.server_host, args.server_port, args.heartbeat_freq, gfd_link, args.replica_public_host)
+    except KeyboardInterrupt:
+        # Every other process (client.py, server_replica.py, gfd.py) already
+        # catches Ctrl-C cleanly here; this file was just missed. Ctrl-C can
+        # land inside time.sleep() between heartbeats, inside a blocking
+        # connect() attempt, or inside receive_line() - all perfectly normal
+        # places for an operator to stop this LFD (e.g. to restart it with a
+        # different --heartbeat-freq per the Milestone 1 rubric), not a
+        # crash to report a traceback for.
+        log_utils.log(args.lfd_id, "Shutting down (Ctrl-C).", category="lifecycle")
 
 
 if __name__ == "__main__":
