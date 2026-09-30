@@ -142,7 +142,23 @@ def parse_message(line: str) -> dict:
     Every message type is parsed into a plain dict (rather than distinct classes)
     to keep this generic: new message types (e.g. CHECKPOINT in M3) can be added
     by adding one more branch here without changing the calling code's shape.
+
+    Always raises ValueError for anything malformed - an unknown message
+    type, a non-numeric field that should be an int, or a line with fewer
+    fields than expected (which would otherwise surface as a raw IndexError
+    from the unpacking below). A flaky network can genuinely deliver a
+    truncated or garbled line; every caller across this codebase catches
+    ValueError right alongside its usual connection-error handling, so a bad
+    message is always treated like any other dropped/failed peer instead of
+    crashing whatever process received it.
     """
+    try:
+        return _parse_message_fields(line)
+    except IndexError as error:
+        raise ValueError(f"truncated or malformed message: {line!r}") from error
+
+
+def _parse_message_fields(line: str) -> dict:
     fields = line.strip().split(_DELIMITER)
     message_type = fields[0]
 

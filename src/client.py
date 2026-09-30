@@ -99,11 +99,14 @@ def run_client(client_id: str, replica_id: str, server_host: str, server_port: i
                 if not reply_line:
                     log_utils.log(client_id, f"Connection to {replica_id} closed unexpectedly.", category="failure")
                     break
-            except OSError as error:
+                reply = protocol.parse_message(reply_line)
+            except (OSError, ValueError) as error:
+                # ValueError covers a truncated/garbled reply (parse_message
+                # always raises ValueError for that, never a raw IndexError),
+                # on top of the usual connection-error cases.
                 log_utils.log(client_id, f"Connection to {replica_id} failed: {error}", category="failure")
                 break
 
-            reply = protocol.parse_message(reply_line)
             log_utils.log(
                 client_id,
                 f"Received <{client_id}, {replica_id}, {request_num}, reply> "
@@ -273,7 +276,10 @@ def _run_multireplica_request_loop(client_id: str, replica_set: ReplicaSet, add_
                 if not reply_line:
                     raise ConnectionError("Connection closed by replica")
                 reply = protocol.parse_message(reply_line)
-            except (socket.timeout, OSError, ConnectionError) as error:
+            except (socket.timeout, OSError, ConnectionError, ValueError) as error:
+                # ValueError covers a truncated/garbled reply from this
+                # replica (parse_message always raises ValueError for that),
+                # treated exactly like any other reason to mark it down.
                 log_utils.log(
                     client_id,
                     f"request_num {request_num}: no reply from {replica_id} ({error}); marking it down.",
@@ -354,7 +360,14 @@ def _gfd_listener_thread(client_id: str, gfd_sock: socket.socket, replica_set: R
         if not line:
             log_utils.log(client_id, "GFD connection closed; no further membership updates will be received.", category="failure")
             return
-        message = protocol.parse_message(line)
+        try:
+            message = protocol.parse_message(line)
+        except ValueError as error:
+            # A single garbled broadcast shouldn't stop listening for every
+            # future one - log it and keep going; the GFD will send another
+            # full snapshot on the next membership change regardless.
+            log_utils.log(client_id, f"Ignoring malformed membership update from GFD: {error}", category="failure")
+            continue
         if message["type"] == protocol.MEMBERSHIP:
             members = message["members"]
             names = ", ".join(rid for rid, _h, _p in members) or "(none)"
@@ -362,21 +375,49 @@ def _gfd_listener_thread(client_id: str, gfd_sock: socket.socket, replica_set: R
             replica_set.sync_membership(members)
 
 
+def _register_with_gfd(client_id: str, gfd_host: str, gfd_port: int):
+    """Connect, send CLIENT_HELLO, and wait for the initial MEMBERSHIP
+    snapshot - retrying the *whole* handshake (not just the connect) if
+    anything about it fails.
+
+    A connection can complete its TCP handshake and then die before a
+    single byte of application data crosses it either way - the same
+    "connects, then immediately breaks" pattern already seen with replica
+    connections on a flaky network. Previously, a failure here (in the
+    send or the first receive) was completely unguarded and crashed the
+    whole client; now the handshake is retried, matching how every other
+    connection-with-retry loop in this codebase already treats the GFD as
+    an acceptable, transient single point of failure rather than a fatal
+    dependency.
+
+    Returns (gfd_sock, initial_members).
+    """
+    while True:
+        gfd_sock = _connect_to_gfd_for_client(client_id, gfd_host, gfd_port)
+        try:
+            protocol.send_line(gfd_sock, protocol.build_client_hello(client_id))
+            log_utils.log(client_id, "Sent CLIENT_HELLO to GFD; waiting for initial membership.", category="lifecycle")
+
+            first_line = protocol.receive_line(gfd_sock)
+            if not first_line:
+                raise ConnectionError("GFD closed the connection before sending initial membership")
+            first_message = protocol.parse_message(first_line)
+            return gfd_sock, first_message["members"]
+        except (OSError, ValueError, ConnectionError) as error:
+            log_utils.log(client_id, f"Lost connection to GFD during registration ({error}); retrying.", category="failure")
+            try:
+                gfd_sock.close()
+            except OSError:
+                pass
+            time.sleep(1.0)
+
+
 def run_client_via_gfd(client_id: str, gfd_host: str, gfd_port: int, add_amount: int, request_interval_sec: float, request_count: int, manual_mode: bool, reply_timeout_sec: float) -> None:
     """Milestone 2, GFD-driven mode (the rubric's required path): register
     with the GFD, bootstrap from its initial membership snapshot, then keep
     a background thread listening for further snapshots for the rest of
     this client's lifetime while the main loop keeps sending requests."""
-    gfd_sock = _connect_to_gfd_for_client(client_id, gfd_host, gfd_port)
-    protocol.send_line(gfd_sock, protocol.build_client_hello(client_id))
-    log_utils.log(client_id, f"Sent CLIENT_HELLO to GFD; waiting for initial membership.", category="lifecycle")
-
-    first_line = protocol.receive_line(gfd_sock)
-    if not first_line:
-        log_utils.log(client_id, "GFD closed the connection before sending initial membership; exiting.", category="failure")
-        return
-    first_message = protocol.parse_message(first_line)
-    members = first_message["members"]
+    gfd_sock, members = _register_with_gfd(client_id, gfd_host, gfd_port)
     names = ", ".join(rid for rid, _h, _p in members) or "(none)"
     log_utils.log(client_id, f"Received initial membership from GFD: {len(members)} member(s): {names}", category="membership")
 
@@ -467,7 +508,10 @@ def main() -> None:
                 reply_timeout_sec=args.reply_timeout_ms / 1000.0,
             )
         elif args.replicas is not None:
-            replicas = _parse_replicas_arg(args.replicas)
+            try:
+                replicas = _parse_replicas_arg(args.replicas)
+            except ValueError as error:
+                raise SystemExit(f"Invalid --replicas value: {error}")
             run_client_multireplica(
                 args.client_id,
                 replicas,

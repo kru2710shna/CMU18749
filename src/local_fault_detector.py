@@ -117,11 +117,13 @@ def run_gfd_heartbeat_loop(lfd_id: str, gfd_link: GFDLink, heartbeat_freq_sec: f
                 f"[{heartbeat_count}] LFD received heartbeat ACK from GFD",
                 category="heartbeat",
             )
-        except (socket.timeout, OSError, ConnectionError) as error:
+        except (socket.timeout, OSError, ConnectionError, ValueError) as error:
             # Per the assignment's assumptions, the GFD (and RM above it)
             # are acceptable single points of failure for this milestone;
             # we just log it and keep retrying rather than tearing down the
-            # whole LFD process.
+            # whole LFD process. ValueError covers a truncated/garbled reply
+            # (protocol.parse_message always raises ValueError for that,
+            # never a raw IndexError) on top of the usual connection errors.
             log_utils.log(
                 lfd_id,
                 f"[{heartbeat_count}] Heartbeat to GFD FAILED/TIMED OUT ({error}).",
@@ -192,7 +194,11 @@ def run_local_fault_detector(lfd_id: str, replica_id: str, server_host: str, ser
                         log_utils.log(lfd_id, f"{lfd_id}: add replica {replica_id}", category="membership")
                         registered_with_gfd = True
 
-                except (socket.timeout, OSError, ConnectionError) as error:
+                except (socket.timeout, OSError, ConnectionError, ValueError) as error:
+                    # ValueError covers a truncated/garbled reply from the
+                    # replica (protocol.parse_message always raises
+                    # ValueError for that, never a raw IndexError), treated
+                    # exactly like any other reason to presume it crashed.
                     log_utils.log(
                         lfd_id,
                         f"[{heartbeat_count}] Heartbeat to {replica_id} FAILED/TIMED OUT ({error}). "
@@ -249,31 +255,36 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    gfd_link = None
-    if args.gfd_host is not None and args.gfd_port is not None:
-        if args.replica_public_host is None:
-            raise SystemExit("--replica-public-host is required when --gfd-host/--gfd-port are given, "
-                              "so clients on the sacred machine know where to reach this replica.")
-        gfd_link = _connect_to_gfd(args.lfd_id, args.gfd_host, args.gfd_port)
-        gfd_thread = threading.Thread(
-            target=run_gfd_heartbeat_loop,
-            args=(args.lfd_id, gfd_link, args.heartbeat_freq),
-            daemon=True,
-        )
-        gfd_thread.start()
-    elif args.gfd_host is not None or args.gfd_port is not None:
-        raise SystemExit("--gfd-host and --gfd-port must be supplied together (or not at all).")
+    if args.heartbeat_freq <= 0:
+        raise SystemExit("--heartbeat-freq must be a positive number of seconds.")
 
+    # Every other process (client.py, server_replica.py, gfd.py) already
+    # catches Ctrl-C cleanly; this file was just missed. Ctrl-C can land in
+    # several different blocking spots - the GFD connect-retry sleep below,
+    # the replica connect-retry sleep, or a send/receive inside
+    # run_local_fault_detector() - all perfectly normal places for an
+    # operator to stop this LFD (e.g. to restart it with a different
+    # --heartbeat-freq per the Milestone 1 rubric), not a crash to report a
+    # traceback for. One try wrapping the whole rest of main() covers every
+    # one of those spots, rather than just the last call made.
     try:
+        gfd_link = None
+        if args.gfd_host is not None and args.gfd_port is not None:
+            if args.replica_public_host is None:
+                raise SystemExit("--replica-public-host is required when --gfd-host/--gfd-port are given, "
+                                  "so clients on the sacred machine know where to reach this replica.")
+            gfd_link = _connect_to_gfd(args.lfd_id, args.gfd_host, args.gfd_port)
+            gfd_thread = threading.Thread(
+                target=run_gfd_heartbeat_loop,
+                args=(args.lfd_id, gfd_link, args.heartbeat_freq),
+                daemon=True,
+            )
+            gfd_thread.start()
+        elif args.gfd_host is not None or args.gfd_port is not None:
+            raise SystemExit("--gfd-host and --gfd-port must be supplied together (or not at all).")
+
         run_local_fault_detector(args.lfd_id, args.replica_id, args.server_host, args.server_port, args.heartbeat_freq, gfd_link, args.replica_public_host)
     except KeyboardInterrupt:
-        # Every other process (client.py, server_replica.py, gfd.py) already
-        # catches Ctrl-C cleanly here; this file was just missed. Ctrl-C can
-        # land inside time.sleep() between heartbeats, inside a blocking
-        # connect() attempt, or inside receive_line() - all perfectly normal
-        # places for an operator to stop this LFD (e.g. to restart it with a
-        # different --heartbeat-freq per the Milestone 1 rubric), not a
-        # crash to report a traceback for.
         log_utils.log(args.lfd_id, "Shutting down (Ctrl-C).", category="lifecycle")
 
 
