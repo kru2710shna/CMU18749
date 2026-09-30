@@ -101,6 +101,16 @@ class GlobalFaultDetector:
                     elif message["type"] == protocol.CLIENT_HELLO:
                         is_client = True
                         self._handle_client_hello(conn, message)
+        except OSError as error:
+            # A connection can die mid-read for reasons that have nothing to
+            # do with the peer choosing to disconnect (a dropped/reset
+            # network path, an LFD or client process being killed). net_utils
+            # gives every connection its own thread, so this never took down
+            # the GFD or any other connection - but left uncaught, it dumped
+            # a raw traceback per drop instead of the clean one-line message
+            # every other peer-to-peer error path in this codebase already
+            # uses (see the identical fix in server_replica.py).
+            log_utils.log("GFD", f"Connection from {addr} dropped: {error}", category="failure")
         finally:
             if is_client:
                 with self._clients_lock:
