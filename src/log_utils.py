@@ -16,25 +16,22 @@ from datetime import datetime
 _COLOR_CODES = {
     "reset": "\033[0m",
     "cyan": "\033[36m",     # client <-> server request/reply traffic
-    "yellow": "\033[33m",   # heartbeat traffic (LFD <-> server, LFD <-> GFD)
+    "yellow": "\033[33m",   # heartbeat traffic (LFD <-> server)
     "magenta": "\033[35m",  # state changes (my_state before/after)
     "red": "\033[31m",      # failures / timeouts - should stand out
     "green": "\033[32m",    # successful lifecycle events (startup, registration)
-    "blue": "\033[34m",     # membership changes (GFD add/remove a replica) and duplicate-reply detection
     "white": "\033[37m",    # default / uncategorized messages
 }
 
 # Message categories mapped to a color. Every call site picks one of these
 # categories instead of a raw color, so the color scheme stays consistent and
-# is easy to extend in later milestones.
+# is easy to extend in later milestones (e.g. add "membership" or "duplicate").
 CATEGORY_COLORS = {
     "request_reply": "cyan",
     "heartbeat": "yellow",
     "state": "magenta",
     "failure": "red",
     "lifecycle": "green",
-    "membership": "blue",
-    "duplicate": "blue",
     "default": "white",
 }
 
@@ -49,9 +46,4 @@ def log(process_label: str, message: str, category: str = "default") -> None:
     color_name = CATEGORY_COLORS.get(category, "default")
     color_code = _COLOR_CODES[color_name]
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
-    # flush=True: stdout is only line-buffered by default when connected to
-    # a real terminal. Redirected to a file, piped, or run through an IDE's
-    # "Run Python File" button (not a real TTY), it's fully buffered instead,
-    # so lines can sit invisible for a long time (or forever, if the process
-    # is still running) without this.
-    print(f"{color_code}[{timestamp}] [{process_label}] {message}{_COLOR_CODES['reset']}", flush=True)
+    print(f"{color_code}[{timestamp}] [{process_label}] {message}{_COLOR_CODES['reset']}")

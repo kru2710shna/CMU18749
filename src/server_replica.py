@@ -41,34 +41,18 @@ class ServerReplica:
         A single connection is used exclusively by one peer (either one client,
         or the LFD) for its whole lifetime, so we branch on message type as
         each line arrives rather than assuming a fixed peer per connection.
-
-        A connection can die mid-read for reasons that have nothing to do
-        with the peer choosing to disconnect - a dropped/reset network path,
-        for instance - surfacing as an OSError from receive_line() rather
-        than a clean empty-string return. A flaky network can also deliver a
-        truncated/garbled line, which protocol.parse_message() always turns
-        into a ValueError rather than a raw IndexError (see its docstring).
-        Both previously uncaught here, either crashed the connection's
-        dedicated thread with a raw traceback on the console; net_utils
-        gives every connection its own thread, so it never took down the
-        server or any other connection, but it's noisy and unhelpful during
-        a demo. Log it cleanly instead, same as every other peer-to-peer
-        error path in this codebase already does.
         """
         with conn:
-            try:
-                while True:
-                    line = protocol.receive_line(conn)
-                    if not line:
-                        break
-                    message = protocol.parse_message(line)
+            while True:
+                line = protocol.receive_line(conn)
+                if not line:
+                    break
+                message = protocol.parse_message(line)
 
-                    if message["type"] == protocol.REQUEST:
-                        self._handle_request(conn, message)
-                    elif message["type"] == protocol.HEARTBEAT:
-                        self._handle_heartbeat(conn, message)
-            except (OSError, ValueError) as error:
-                log_utils.log(self.replica_id, f"Connection from {addr} dropped: {error}", category="failure")
+                if message["type"] == protocol.REQUEST:
+                    self._handle_request(conn, message)
+                elif message["type"] == protocol.HEARTBEAT:
+                    self._handle_heartbeat(conn, message)
 
     def _handle_request(self, conn, message: dict) -> None:
         """Apply a client's request to my_state and send back the new value."""
