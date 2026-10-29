@@ -1,3 +1,4 @@
+# src/net_utils.py
 """
 Reusable TCP socket helpers shared by every process.
 
