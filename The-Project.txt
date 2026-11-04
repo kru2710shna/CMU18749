@@ -271,6 +271,7 @@ What I will look for:
 What I will not look for: 
 * Automated recovery, i.e., I am not looking to see the dead replica automatically be brought to life. 
 * Checkpointing messages. 
+
 MILESTONE #3 EXPECTATIONS (5% of Grade)
 Goals 
 Implement a passively-replicated server with 3 replicas. 
