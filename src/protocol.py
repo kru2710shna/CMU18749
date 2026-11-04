@@ -1,9 +1,9 @@
 """
-Shared wire protocol for Milestones 1, 2, and 3.
+Shared wire protocol for Milestones 1 through 4.
 
 M1:
     REQUEST|<client_id>|<replica_id>|<request_num>|<op>|<value>
-    REPLY|<client_id>|<replica_id>|<request_num>|<op>|<value>
+    REPLY|<client_id>|<replica_id>|<request_num>|<op>|<value>|<stable_request_num>
     HEARTBEAT|<lfd_id>|<replica_id>|<heartbeat_count>
     ALIVE|<replica_id>|<lfd_id>|<heartbeat_count>
 
@@ -13,13 +13,23 @@ M2:
     MEMBER_ADD|<lfd_id>|<replica_id>|<public_host>|<public_port>
     MEMBER_DELETE|<lfd_id>|<replica_id>
     CLIENT_HELLO|<client_id>
-    MEMBERSHIP|<replica_id>:<host>:<port>,...
+    MEMBERSHIP|<replica_id>:<host>:<port>,...|<primary_id>
 
 M3:
-    CHECKPOINT|<primary_id>|<checkpoint_num>|<my_state>
+    CHECKPOINT|<sender_id>|<checkpoint_num>|<my_state>|<client_id>:<high_watermark>,...
+
+M4:
+    VIEW|<view_num>|<primary_id>|<ready_id>,...|<replica_id>:<host>:<port>,...
+    REPLICA_HELLO|<replica_id>
+    REPLICA_STATUS|<replica_id>|<i_am_ready>
+
+<stable_request_num> tells a passive client which of its requests are covered
+by a checkpoint the backups hold. <primary_id> is empty in active replication.
 """
 
 import socket
+import threading
+import weakref
 
 
 REQUEST = "REQUEST"
@@ -36,8 +46,17 @@ MEMBERSHIP = "MEMBERSHIP"
 
 CHECKPOINT = "CHECKPOINT"
 
+VIEW = "VIEW"
+REPLICA_HELLO = "REPLICA_HELLO"
+REPLICA_STATUS = "REPLICA_STATUS"
+
 _DELIMITER = "|"
 _ENCODING = "utf-8"
+
+# TCP is a byte stream: one recv() can return several messages or part of one.
+# Bytes received past the end of the current line wait here for the next call.
+_receive_buffers = weakref.WeakKeyDictionary()
+_receive_buffers_lock = threading.Lock()
 
 
 def build_request(
@@ -57,8 +76,17 @@ def build_reply(
     request_num: int,
     op: str,
     value: str,
+    stable_request_num: int = 0,
 ) -> str:
-    fields = [REPLY, client_id, replica_id, str(request_num), op, str(value)]
+    fields = [
+        REPLY,
+        client_id,
+        replica_id,
+        str(request_num),
+        op,
+        str(value),
+        str(stable_request_num),
+    ]
     return _DELIMITER.join(fields)
 
 
@@ -109,27 +137,69 @@ def build_client_hello(client_id: str) -> str:
     return _DELIMITER.join([CLIENT_HELLO, client_id])
 
 
-def build_membership(members) -> str:
-    entries = [
+def _format_members(members) -> str:
+    return ",".join(
         f"{replica_id}:{host}:{port}"
         for replica_id, host, port in members
-    ]
-    return _DELIMITER.join([MEMBERSHIP, ",".join(entries)])
+    )
+
+
+def _parse_members(field: str) -> list:
+    members = []
+
+    if field:
+        for entry in field.split(","):
+            replica_id, host, port_str = entry.split(":")
+            members.append((replica_id, host, int(port_str)))
+
+    return members
+
+
+def build_membership(members, primary_id: str = None) -> str:
+    return _DELIMITER.join(
+        [MEMBERSHIP, _format_members(members), primary_id or ""]
+    )
 
 
 def build_checkpoint(
-    primary_id: str,
+    sender_id: str,
     checkpoint_num: int,
     my_state: int,
+    high_watermarks: dict = None,
 ) -> str:
-    """Build an M3 primary-to-backup state checkpoint."""
+    """Build a state checkpoint: my_state plus each client's applied request."""
+    watermarks = ",".join(
+        f"{client_id}:{request_num}"
+        for client_id, request_num in (high_watermarks or {}).items()
+    )
     fields = [
         CHECKPOINT,
-        primary_id,
+        sender_id,
         str(checkpoint_num),
         str(my_state),
+        watermarks,
     ]
     return _DELIMITER.join(fields)
+
+
+def build_view(view_num: int, primary_id: str, ready, members) -> str:
+    """Build the RM's decision about who is primary and who is ready."""
+    fields = [
+        VIEW,
+        str(view_num),
+        primary_id or "",
+        ",".join(ready),
+        _format_members(members),
+    ]
+    return _DELIMITER.join(fields)
+
+
+def build_replica_hello(replica_id: str) -> str:
+    return _DELIMITER.join([REPLICA_HELLO, replica_id])
+
+
+def build_replica_status(replica_id: str, i_am_ready: int) -> str:
+    return _DELIMITER.join([REPLICA_STATUS, replica_id, str(i_am_ready)])
 
 
 def parse_message(line: str) -> dict:
@@ -145,7 +215,7 @@ def _parse_message_fields(line: str) -> dict:
     message_type = fields[0]
 
     if message_type in (REQUEST, REPLY):
-        return {
+        message = {
             "type": message_type,
             "client_id": fields[1],
             "replica_id": fields[2],
@@ -153,6 +223,11 @@ def _parse_message_fields(line: str) -> dict:
             "op": fields[4],
             "value": fields[5],
         }
+
+        if message_type == REPLY:
+            message["stable_request_num"] = int(fields[6])
+
+        return message
 
     elif message_type == HEARTBEAT:
         return {
@@ -200,24 +275,48 @@ def _parse_message_fields(line: str) -> dict:
         }
 
     elif message_type == MEMBERSHIP:
-        members = []
-
-        if fields[1]:
-            for entry in fields[1].split(","):
-                replica_id, host, port_str = entry.split(":")
-                members.append((replica_id, host, int(port_str)))
-
         return {
             "type": message_type,
-            "members": members,
+            "members": _parse_members(fields[1]),
+            "primary_id": fields[2] or None,
         }
 
     elif message_type == CHECKPOINT:
+        high_watermarks = {}
+
+        if fields[4]:
+            for entry in fields[4].split(","):
+                client_id, request_num = entry.split(":")
+                high_watermarks[client_id] = int(request_num)
+
         return {
             "type": message_type,
             "primary_id": fields[1],
             "checkpoint_num": int(fields[2]),
             "my_state": int(fields[3]),
+            "high_watermarks": high_watermarks,
+        }
+
+    elif message_type == VIEW:
+        return {
+            "type": message_type,
+            "view_num": int(fields[1]),
+            "primary_id": fields[2] or None,
+            "ready": fields[3].split(",") if fields[3] else [],
+            "members": _parse_members(fields[4]),
+        }
+
+    elif message_type == REPLICA_HELLO:
+        return {
+            "type": message_type,
+            "replica_id": fields[1],
+        }
+
+    elif message_type == REPLICA_STATUS:
+        return {
+            "type": message_type,
+            "replica_id": fields[1],
+            "i_am_ready": int(fields[2]),
         }
 
     raise ValueError(f"Unknown message type: {message_type!r}")
@@ -229,10 +328,21 @@ def send_line(sock: socket.socket, line: str) -> None:
 
 
 def receive_line(sock: socket.socket, buffer_size: int = 4096) -> str:
-    """Receive one newline-terminated protocol message."""
-    data = sock.recv(buffer_size)
+    """Receive one newline-terminated message; "" means the peer closed."""
+    with _receive_buffers_lock:
+        buffer = _receive_buffers.setdefault(sock, bytearray())
 
-    if not data:
-        return ""
+    while True:
+        newline_index = buffer.find(b"\n")
 
-    return data.decode(_ENCODING).strip()
+        if newline_index >= 0:
+            line = bytes(buffer[:newline_index])
+            del buffer[:newline_index + 1]
+            return line.decode(_ENCODING).strip()
+
+        data = sock.recv(buffer_size)
+
+        if not data:
+            return ""
+
+        buffer.extend(data)

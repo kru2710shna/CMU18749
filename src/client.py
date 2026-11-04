@@ -1,5 +1,5 @@
 """
-Client process for Milestones 1, 2, and 3.
+Client process for Milestones 1 through 4.
 
 M1:
     Connect to one replica and send ADD requests.
@@ -11,9 +11,17 @@ M2 active replication:
 M3 passive replication:
     Learn all replicas from the GFD and open connections to them, but send
     requests only to the primary replica (S1 by default). Only S1 replies.
+
+M4 recovery:
+    The GFD also reports the primary chosen by the RM. A request is retried
+    under the same request_num until it gets a reply, and servers discard
+    duplicates. After a failover, a passive client resends the requests that
+    no checkpoint is known to cover, so the new primary does not lose them.
 """
 
 import argparse
+import collections
+import queue
 import socket
 import threading
 import time
@@ -21,6 +29,11 @@ import time
 import log_utils
 import net_utils
 import protocol
+
+
+# After the first reply, how long to keep collecting duplicates. A not-ready
+# replica never replies, and it must not hold up the client's next request.
+_DUPLICATE_WINDOW_SEC = 0.3
 
 
 def _prompt_for_add_amount(client_id: str, default_amount: int) -> int:
@@ -165,13 +178,17 @@ class ReplicaSet:
     """
     Thread-safe registry of sockets to replicas.
 
-    In M2/M3 GFD mode, the background GFD listener updates this registry
-    whenever membership changes. In static mode, it is populated once from
-    --replicas.
+    In GFD mode, the background GFD listener updates this registry whenever
+    membership changes. In static mode, it is populated once from --replicas.
+
+    Each socket has a reader thread that puts (replica_id, reply) on the
+    replies queue, or (replica_id, None) when the connection is lost.
     """
 
-    def __init__(self, client_id: str):
+    def __init__(self, client_id: str, primary_id: str = None):
         self.client_id = client_id
+        self.primary_id = primary_id
+        self.replies = queue.Queue()
         self._lock = threading.Lock()
 
         # replica_id -> [socket, alive]
@@ -185,10 +202,13 @@ class ReplicaSet:
                 for replica_id, entry in self._entries.items()
             ]
 
-    def mark_dead(self, replica_id: str) -> None:
+    def mark_dead(self, replica_id: str, sock: socket.socket) -> None:
+        """Mark a connection dead, unless a newer one has replaced it."""
         with self._lock:
-            if replica_id in self._entries:
-                self._entries[replica_id][1] = False
+            entry = self._entries.get(replica_id)
+
+            if entry is not None and entry[0] is sock:
+                entry[1] = False
 
     def any_alive(self) -> bool:
         with self._lock:
@@ -197,13 +217,55 @@ class ReplicaSet:
                 for _sock, alive in self._entries.values()
             )
 
-    def sync_membership(self, members) -> None:
+    def _read_replies(self, replica_id: str, sock: socket.socket) -> None:
+        try:
+            while True:
+                line = protocol.receive_line(sock)
+
+                if not line:
+                    break
+
+                message = protocol.parse_message(line)
+
+                if message["type"] == protocol.REPLY:
+                    self.replies.put((replica_id, message))
+
+        except (OSError, ValueError):
+            pass
+
+        self.mark_dead(replica_id, sock)
+        self.replies.put((replica_id, None))
+
+    @staticmethod
+    def _close(sock: socket.socket) -> None:
+        # shutdown() wakes the reader thread blocked in recv(); close() alone
+        # does not.
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+    def sync_membership(self, members, primary_id: str = None) -> None:
         """
         Reconcile client sockets with a full membership snapshot from GFD.
 
-        In M3, this means clients initially open connections to S1/S2/S3.
-        The M3 request loop itself sends traffic only to primary S1.
+        In passive mode, clients open connections to every replica, but the
+        request loop sends traffic only to the primary.
         """
+        if primary_id is not None and primary_id != self.primary_id:
+            self.primary_id = primary_id
+
+            log_utils.log(
+                self.client_id,
+                f"Primary is now {primary_id}.",
+                category="membership",
+            )
+
         target_ids = {
             replica_id
             for replica_id, _host, _port in members
@@ -214,11 +276,7 @@ class ReplicaSet:
 
             for replica_id in current_ids - target_ids:
                 sock, _alive = self._entries.pop(replica_id)
-
-                try:
-                    sock.close()
-                except OSError:
-                    pass
+                self._close(sock)
 
                 log_utils.log(
                     self.client_id,
@@ -260,11 +318,14 @@ class ReplicaSet:
                 old = self._entries.get(replica_id)
                 self._entries[replica_id] = [sock, True]
 
+            threading.Thread(
+                target=self._read_replies,
+                args=(replica_id, sock),
+                daemon=True,
+            ).start()
+
             if old is not None:
-                try:
-                    old[0].close()
-                except OSError:
-                    pass
+                self._close(old[0])
 
     def close_all(self) -> None:
         with self._lock:
@@ -275,10 +336,85 @@ class ReplicaSet:
             self._entries.clear()
 
         for sock in sockets:
-            try:
-                sock.close()
-            except OSError:
-                pass
+            self._close(sock)
+
+
+def _collect_active_replies(
+    client_id: str,
+    replica_set: ReplicaSet,
+    request_num: int,
+    expected_replicas: list,
+    reply_timeout_sec: float,
+) -> bool:
+    """Deliver the first reply and visibly discard duplicates."""
+    waiting = set(expected_replicas)
+    delivered = False
+    deadline = time.monotonic() + reply_timeout_sec
+
+    while waiting:
+        remaining = deadline - time.monotonic()
+
+        if remaining <= 0:
+            break
+
+        try:
+            replica_id, reply = replica_set.replies.get(timeout=remaining)
+        except queue.Empty:
+            break
+
+        if reply is None:
+            if replica_id in waiting:
+                waiting.discard(replica_id)
+
+                log_utils.log(
+                    client_id,
+                    f"request_num {request_num}: "
+                    f"connection to {replica_id} lost.",
+                    category="failure",
+                )
+            continue
+
+        reply_num = reply["request_num"]
+
+        log_utils.log(
+            client_id,
+            f"Received <{client_id}, {replica_id}, {reply_num}, reply> "
+            f"(my_state={reply['value']})",
+            category="request_reply",
+        )
+
+        if reply_num != request_num:
+            log_utils.log(
+                client_id,
+                f"request_num {reply_num}: "
+                f"Discarded duplicate reply from {replica_id}",
+                category="duplicate",
+            )
+            continue
+
+        waiting.discard(replica_id)
+
+        if delivered:
+            log_utils.log(
+                client_id,
+                f"request_num {request_num}: "
+                f"Discarded duplicate reply from {replica_id}",
+                category="duplicate",
+            )
+
+        else:
+            delivered = True
+            deadline = min(deadline, time.monotonic() + _DUPLICATE_WINDOW_SEC)
+
+    if delivered and waiting:
+        log_utils.log(
+            client_id,
+            f"request_num {request_num}: no reply yet from "
+            f"{', '.join(sorted(waiting))}; continuing.",
+            category="lifecycle",
+        )
+
+    return delivered
 
 
 def _run_multireplica_request_loop(
@@ -291,23 +427,24 @@ def _run_multireplica_request_loop(
     reply_timeout_sec: float,
 ) -> None:
     """
-    M2 active replication:
-    send identical requests to every healthy replica, deliver the first
-    reply, and visibly discard duplicate replies.
+    Active replication: send identical requests to every healthy replica,
+    deliver the first reply, and visibly discard duplicate replies.
     """
     request_num = 1
+    current_amount = None
 
     while request_count <= 0 or request_num <= request_count:
-        current_amount = (
-            _prompt_for_add_amount(client_id, add_amount)
-            if manual_mode
-            else add_amount
-        )
+        if current_amount is None:
+            current_amount = (
+                _prompt_for_add_amount(client_id, add_amount)
+                if manual_mode
+                else add_amount
+            )
 
-        connections = replica_set.snapshot()
+        sent_to = []
 
         # Send request_num N to every healthy active replica first.
-        for replica_id, sock, alive in connections:
+        for replica_id, sock, alive in replica_set.snapshot():
             if not alive:
                 continue
 
@@ -330,8 +467,10 @@ def _run_multireplica_request_loop(
                     category="request_reply",
                 )
 
+                sent_to.append(replica_id)
+
             except OSError as error:
-                replica_set.mark_dead(replica_id)
+                replica_set.mark_dead(replica_id, sock)
 
                 log_utils.log(
                     client_id,
@@ -339,84 +478,106 @@ def _run_multireplica_request_loop(
                     category="failure",
                 )
 
-        # Deliver first reply; visibly discard duplicates.
-        delivered = False
-
-        for replica_id, sock, alive in connections:
-            if not alive:
-                continue
-
-            try:
-                sock.settimeout(reply_timeout_sec)
-
-                reply_line = protocol.receive_line(sock)
-
-                if not reply_line:
-                    raise ConnectionError(
-                        "Connection closed by replica."
-                    )
-
-                reply = protocol.parse_message(reply_line)
-
-                if reply["type"] != protocol.REPLY:
-                    raise ValueError(
-                        f"Expected REPLY, received {reply['type']!r}"
-                    )
-
-            except (
-                socket.timeout,
-                OSError,
-                ConnectionError,
-                ValueError,
-            ) as error:
-                replica_set.mark_dead(replica_id)
-
-                log_utils.log(
-                    client_id,
-                    f"request_num {request_num}: "
-                    f"no reply from {replica_id} ({error}); "
-                    "marking it down.",
-                    category="failure",
-                )
-                continue
-
-            if not delivered:
-                delivered = True
-
-                log_utils.log(
-                    client_id,
-                    f"Received <{client_id}, {replica_id}, "
-                    f"{request_num}, reply> "
-                    f"(my_state={reply['value']})",
-                    category="request_reply",
-                )
-
-            else:
-                log_utils.log(
-                    client_id,
-                    f"request_num {request_num}: "
-                    f"Discarded duplicate reply from {replica_id}",
-                    category="duplicate",
-                )
-
-        if not delivered:
+        if not sent_to:
             log_utils.log(
                 client_id,
                 f"request_num {request_num}: "
-                "no replica responded at all.",
+                "no replica connected; waiting.",
                 category="failure",
             )
+            time.sleep(0.5)
+            continue
+
+        if not _collect_active_replies(
+            client_id,
+            replica_set,
+            request_num,
+            sent_to,
+            reply_timeout_sec,
+        ):
+            log_utils.log(
+                client_id,
+                f"request_num {request_num}: "
+                "no replica responded; retrying.",
+                category="failure",
+            )
+            continue
 
         request_num += 1
+        current_amount = None
 
         if not manual_mode and request_interval_sec > 0:
             time.sleep(request_interval_sec)
 
 
-def _run_passive_request_loop(
+def _exchange_with_primary(
     client_id: str,
     replica_set: ReplicaSet,
     primary_id: str,
+    sock: socket.socket,
+    request_num: int,
+    amount: int,
+    reply_timeout_sec: float,
+) -> dict:
+    """Send one request to the primary and wait for its matching reply."""
+    protocol.send_line(
+        sock,
+        protocol.build_request(
+            client_id,
+            primary_id,
+            request_num,
+            "ADD",
+            amount,
+        ),
+    )
+
+    log_utils.log(
+        client_id,
+        f"Sent <{client_id}, {primary_id}, {request_num}, request> "
+        f"(ADD {amount})",
+        category="request_reply",
+    )
+
+    deadline = time.monotonic() + reply_timeout_sec
+
+    while True:
+        remaining = deadline - time.monotonic()
+
+        if remaining <= 0:
+            raise TimeoutError("no reply before the timeout")
+
+        try:
+            replica_id, reply = replica_set.replies.get(timeout=remaining)
+        except queue.Empty:
+            raise TimeoutError("no reply before the timeout") from None
+
+        if reply is None:
+            if replica_id == primary_id:
+                raise ConnectionError("connection to primary lost")
+            continue
+
+        if replica_id != primary_id or reply["request_num"] != request_num:
+            log_utils.log(
+                client_id,
+                f"request_num {reply['request_num']}: "
+                f"Discarded duplicate reply from {replica_id}",
+                category="duplicate",
+            )
+            continue
+
+        log_utils.log(
+            client_id,
+            f"Received <{client_id}, {primary_id}, {request_num}, reply> "
+            f"(my_state={reply['value']})",
+            category="request_reply",
+        )
+
+        return reply
+
+
+def _run_passive_request_loop(
+    client_id: str,
+    replica_set: ReplicaSet,
     add_amount: int,
     request_interval_sec: float,
     request_count: int,
@@ -424,105 +585,101 @@ def _run_passive_request_loop(
     reply_timeout_sec: float,
 ) -> None:
     """
-    M3 passive replication.
+    Passive replication.
 
-    The client may have sockets to S1/S2/S3, but sends requests only to
-    primary_id. Therefore only the primary can produce a reply.
+    The client may have sockets to every replica, but sends requests only to
+    the current primary, so only the primary can produce a reply.
     """
     request_num = 1
+    current_amount = None
+    retry_delay_sec = min(max(request_interval_sec, 0.1), 1.0)
+
+    # (request_num, amount) for requests no checkpoint is known to cover.
+    uncheckpointed = collections.deque()
+    last_primary = None
 
     while request_count <= 0 or request_num <= request_count:
-        primary_connection = None
+        primary_id = replica_set.primary_id
+        primary_socket = None
 
         for replica_id, sock, alive in replica_set.snapshot():
             if replica_id == primary_id and alive:
-                primary_connection = sock
+                primary_socket = sock
                 break
 
-        if primary_connection is None:
+        if primary_socket is None:
             log_utils.log(
                 client_id,
-                f"Primary {primary_id} is not reachable; waiting.",
+                f"Primary {primary_id or '(unknown)'} "
+                "is not reachable; waiting.",
                 category="failure",
             )
-
-            time.sleep(
-                min(max(request_interval_sec, 0.1), 1.0)
-            )
+            time.sleep(retry_delay_sec)
             continue
 
-        current_amount = (
-            _prompt_for_add_amount(client_id, add_amount)
-            if manual_mode
-            else add_amount
-        )
-
-        request_line = protocol.build_request(
-            client_id,
-            primary_id,
-            request_num,
-            "ADD",
-            current_amount,
-        )
-
-        try:
-            protocol.send_line(primary_connection, request_line)
-
-            log_utils.log(
-                client_id,
-                f"Sent <{client_id}, {primary_id}, "
-                f"{request_num}, request> "
-                f"(ADD {current_amount})",
-                category="request_reply",
+        if current_amount is None:
+            current_amount = (
+                _prompt_for_add_amount(client_id, add_amount)
+                if manual_mode
+                else add_amount
             )
 
-            primary_connection.settimeout(reply_timeout_sec)
-
-            reply_line = protocol.receive_line(primary_connection)
-
-            if not reply_line:
-                raise ConnectionError(
-                    "Primary closed the connection."
+        try:
+            if last_primary not in (None, primary_id) and uncheckpointed:
+                log_utils.log(
+                    client_id,
+                    f"Failover from {last_primary} to {primary_id}: resending "
+                    f"{len(uncheckpointed)} request(s) "
+                    "that may not be in its last checkpoint.",
+                    category="membership",
                 )
 
-            reply = protocol.parse_message(reply_line)
+                for old_num, old_amount in list(uncheckpointed):
+                    _exchange_with_primary(
+                        client_id,
+                        replica_set,
+                        primary_id,
+                        primary_socket,
+                        old_num,
+                        old_amount,
+                        reply_timeout_sec,
+                    )
 
-            if reply["type"] != protocol.REPLY:
-                raise ValueError(
-                    f"Expected REPLY, received {reply['type']!r}"
-                )
+            last_primary = primary_id
 
-            if reply["replica_id"] != primary_id:
-                raise ValueError(
-                    f"Expected reply from primary {primary_id}, "
-                    f"received reply from {reply['replica_id']}."
-                )
+            reply = _exchange_with_primary(
+                client_id,
+                replica_set,
+                primary_id,
+                primary_socket,
+                request_num,
+                current_amount,
+                reply_timeout_sec,
+            )
 
-        except (
-            socket.timeout,
-            OSError,
-            ConnectionError,
-            ValueError,
-        ) as error:
-            replica_set.mark_dead(primary_id)
-
+        except OSError as error:
+            # TimeoutError and ConnectionError are both OSErrors. The same
+            # request_num is retried, and the server discards any duplicate.
             log_utils.log(
                 client_id,
                 f"request_num {request_num}: "
-                f"request to primary {primary_id} failed ({error}).",
+                f"request to primary {primary_id} failed ({error}); "
+                "will retry.",
                 category="failure",
             )
+            time.sleep(retry_delay_sec)
             continue
 
-        log_utils.log(
-            client_id,
-            f"Received <{client_id}, {primary_id}, "
-            f"{request_num}, reply> "
-            f"(my_state={reply['value']})",
-            category="request_reply",
-        )
+        uncheckpointed.append((request_num, current_amount))
+
+        while (
+            uncheckpointed
+            and uncheckpointed[0][0] <= reply["stable_request_num"]
+        ):
+            uncheckpointed.popleft()
 
         request_num += 1
+        current_amount = None
 
         if not manual_mode and request_interval_sec > 0:
             time.sleep(request_interval_sec)
@@ -540,7 +697,7 @@ def run_client_multireplica(
     primary_id: str = "S1",
 ) -> None:
     """Run M2 or M3 using a static --replicas list."""
-    replica_set = ReplicaSet(client_id)
+    replica_set = ReplicaSet(client_id, primary_id)
     replica_set.sync_membership(replicas)
 
     if not replica_set.any_alive():
@@ -567,7 +724,6 @@ def run_client_multireplica(
             _run_passive_request_loop(
                 client_id,
                 replica_set,
-                primary_id,
                 add_amount,
                 request_interval_sec,
                 request_count,
@@ -650,7 +806,7 @@ def _register_with_gfd(
                     f"but received {first_message['type']!r}."
                 )
 
-            return gfd_sock, first_message["members"]
+            return gfd_sock, first_message
 
         except (OSError, ConnectionError, ValueError) as error:
             log_utils.log(
@@ -675,8 +831,8 @@ def _gfd_listener_thread(
     """
     Receive future GFD membership snapshots.
 
-    In M3, when S2 fails, this removes only S2's idle client connection;
-    C1/C2/C3 continue using their S1 connection without pausing.
+    When a backup fails, this removes only its idle client connection;
+    clients continue using the primary's connection without pausing.
     """
     while True:
         try:
@@ -715,7 +871,7 @@ def _gfd_listener_thread(
                 category="membership",
             )
 
-            replica_set.sync_membership(members)
+            replica_set.sync_membership(members, message["primary_id"])
 
 
 def run_client_via_gfd(
@@ -731,14 +887,15 @@ def run_client_via_gfd(
     primary_id: str = "S1",
 ) -> None:
     """Run M2 active or M3 passive mode using dynamic GFD membership."""
-    gfd_sock, members = _register_with_gfd(
+    gfd_sock, first_message = _register_with_gfd(
         client_id,
         gfd_host,
         gfd_port,
     )
+    members = first_message["members"]
 
-    replica_set = ReplicaSet(client_id)
-    replica_set.sync_membership(members)
+    replica_set = ReplicaSet(client_id, primary_id)
+    replica_set.sync_membership(members, first_message["primary_id"])
 
     names = ", ".join(
         replica_id
@@ -775,7 +932,6 @@ def run_client_via_gfd(
             _run_passive_request_loop(
                 client_id,
                 replica_set,
-                primary_id,
                 add_amount,
                 request_interval_sec,
                 request_count,
@@ -794,7 +950,7 @@ def run_client_via_gfd(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run an M1/M2/M3 client."
+        description="Run an M1-M4 client."
     )
 
     parser.add_argument(
@@ -887,7 +1043,8 @@ def main() -> None:
     parser.add_argument(
         "--primary-id",
         default="S1",
-        help="M3 passive primary replica ID.",
+        help="M3 passive primary replica ID. With an RM, the GFD reports the "
+             "primary instead.",
     )
 
     args = parser.parse_args()

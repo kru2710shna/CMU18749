@@ -38,6 +38,10 @@ import protocol
 # gets a proportionally more patient timeout.
 _TIMEOUT_MULTIPLIER = 2.0
 
+# Late GFD replies are normal on Wi-Fi, so only this many in a row count as a
+# lost connection.
+_GFD_TIMEOUTS_BEFORE_RECONNECT = 3
+
 
 class GFDLink:
     """Thread-safe wrapper around the LFD's one persistent socket to the GFD.
@@ -48,10 +52,34 @@ class GFDLink:
     reads from this socket, so there's no equivalent need to guard reads.
     """
 
-    def __init__(self, lfd_id: str, sock: socket.socket):
+    def __init__(self, lfd_id: str, gfd_host: str, gfd_port: int):
         self.lfd_id = lfd_id
-        self.sock = sock
+        self.gfd_host = gfd_host
+        self.gfd_port = gfd_port
+        self.sock = _open_gfd_socket(lfd_id, gfd_host, gfd_port)
         self._lock = threading.Lock()
+        self._reconnected = threading.Event()
+
+    def reconnect(self, timeout_sec: float) -> None:
+        """Replace a lost GFD connection, retrying until the GFD is reachable."""
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+        new_sock = _open_gfd_socket(self.lfd_id, self.gfd_host, self.gfd_port)
+        new_sock.settimeout(timeout_sec)
+
+        with self._lock:
+            self.sock = new_sock
+
+        self._reconnected.set()
+
+    def take_reconnected(self) -> bool:
+        """Return whether the link reconnected since the last call."""
+        reconnected = self._reconnected.is_set()
+        self._reconnected.clear()
+        return reconnected
 
     def send_line(self, line: str) -> None:
         """Send one line to the GFD, tolerating the GFD being unreachable.
@@ -73,15 +101,14 @@ class GFDLink:
                 log_utils.log(self.lfd_id, f"Could not notify GFD ({error}); continuing without it.", category="failure")
 
 
-def _connect_to_gfd(lfd_id: str, gfd_host: str, gfd_port: int) -> GFDLink:
+def _open_gfd_socket(lfd_id: str, gfd_host: str, gfd_port: int) -> socket.socket:
     """Keep retrying until the GFD connection is up (mirrors the replica's
-    own connect-with-retry loop below), since the LFD registers with the
-    GFD once at startup per the assignment."""
+    own connect-with-retry loop below)."""
     while True:
         try:
             sock = net_utils.connect_to_server(gfd_host, gfd_port)
             log_utils.log(lfd_id, f"Connected to GFD at {gfd_host}:{gfd_port}", category="lifecycle")
-            return GFDLink(lfd_id, sock)
+            return sock
         except OSError as error:
             log_utils.log(lfd_id, f"Could not connect to GFD: {error}", category="failure")
             time.sleep(1.0)
@@ -96,6 +123,7 @@ def run_gfd_heartbeat_loop(lfd_id: str, gfd_link: GFDLink, heartbeat_freq_sec: f
     timeout_sec = heartbeat_freq_sec * _TIMEOUT_MULTIPLIER
     gfd_link.sock.settimeout(timeout_sec)
     heartbeat_count = 1
+    consecutive_timeouts = 0
 
     while True:
         hello_line = protocol.build_gfd_hello(lfd_id, heartbeat_count)
@@ -117,6 +145,7 @@ def run_gfd_heartbeat_loop(lfd_id: str, gfd_link: GFDLink, heartbeat_freq_sec: f
                 f"[{heartbeat_count}] LFD received heartbeat ACK from GFD",
                 category="heartbeat",
             )
+            consecutive_timeouts = 0
         except (socket.timeout, OSError, ConnectionError, ValueError) as error:
             # Per the assignment's assumptions, the GFD (and RM above it)
             # are acceptable single points of failure for this milestone;
@@ -129,6 +158,14 @@ def run_gfd_heartbeat_loop(lfd_id: str, gfd_link: GFDLink, heartbeat_freq_sec: f
                 f"[{heartbeat_count}] Heartbeat to GFD FAILED/TIMED OUT ({error}).",
                 category="failure",
             )
+            if isinstance(error, socket.timeout):
+                consecutive_timeouts += 1
+            if (
+                not isinstance(error, socket.timeout)
+                or consecutive_timeouts >= _GFD_TIMEOUTS_BEFORE_RECONNECT
+            ):
+                gfd_link.reconnect(timeout_sec)
+                consecutive_timeouts = 0
 
         heartbeat_count += 1
         time.sleep(heartbeat_freq_sec)
@@ -188,8 +225,9 @@ def run_local_fault_detector(lfd_id: str, replica_id: str, server_host: str, ser
 
                     # First successful heartbeat since startup, or since the
                     # replica last failed: tell the GFD this replica just
-                    # became (or became again) a healthy member.
-                    if gfd_link is not None and not registered_with_gfd:
+                    # became (or became again) a healthy member. A GFD that
+                    # lost this LFD has removed its replica, so register again.
+                    if gfd_link is not None and (gfd_link.take_reconnected() or not registered_with_gfd):
                         gfd_link.send_line(protocol.build_member_add(lfd_id, replica_id, replica_public_host, server_port))
                         log_utils.log(lfd_id, f"{lfd_id}: add replica {replica_id}", category="membership")
                         registered_with_gfd = True
@@ -247,11 +285,10 @@ def main() -> None:
     parser.add_argument(
         "--replica-public-host",
         default=None,
-        help="Milestone 2, required with --gfd-host/--gfd-port: the host/IP that OTHER machines "
-             "(clients, on the sacred machine) should use to reach this LFD's replica - i.e. this "
-             "machine's own LAN/Tailscale IP, or 'localhost' for a single-laptop demo. Distinct from "
-             "--server-host, which is how the LFD itself reaches its co-located replica (normally "
-             "'localhost') and is never sent anywhere.",
+        help="The host/IP that OTHER machines (clients, peer replicas) should use to reach this "
+             "LFD's replica. Defaults to this machine's own IP on the network that reaches the GFD. "
+             "Distinct from --server-host, which is how the LFD itself reaches its co-located replica "
+             "(normally 'localhost') and is never sent anywhere.",
     )
     args = parser.parse_args()
 
@@ -269,11 +306,15 @@ def main() -> None:
     # one of those spots, rather than just the last call made.
     try:
         gfd_link = None
+        replica_public_host = None
         if args.gfd_host is not None and args.gfd_port is not None:
-            if args.replica_public_host is None:
-                raise SystemExit("--replica-public-host is required when --gfd-host/--gfd-port are given, "
-                                  "so clients on the sacred machine know where to reach this replica.")
-            gfd_link = _connect_to_gfd(args.lfd_id, args.gfd_host, args.gfd_port)
+            replica_public_host = args.replica_public_host or net_utils.local_ip_toward(args.gfd_host)
+            if net_utils.is_loopback(replica_public_host) and not net_utils.is_loopback(args.gfd_host):
+                raise SystemExit(f"--replica-public-host {replica_public_host} only works on this machine, "
+                                 "but the GFD is on another one. Use this machine's network IP.")
+            log_utils.log(args.lfd_id, f"Other machines will reach {args.replica_id} at "
+                                       f"{replica_public_host}:{args.server_port}", category="lifecycle")
+            gfd_link = GFDLink(args.lfd_id, args.gfd_host, args.gfd_port)
             gfd_thread = threading.Thread(
                 target=run_gfd_heartbeat_loop,
                 args=(args.lfd_id, gfd_link, args.heartbeat_freq),
@@ -283,7 +324,9 @@ def main() -> None:
         elif args.gfd_host is not None or args.gfd_port is not None:
             raise SystemExit("--gfd-host and --gfd-port must be supplied together (or not at all).")
 
-        run_local_fault_detector(args.lfd_id, args.replica_id, args.server_host, args.server_port, args.heartbeat_freq, gfd_link, args.replica_public_host)
+        run_local_fault_detector(args.lfd_id, args.replica_id, args.server_host, args.server_port, args.heartbeat_freq, gfd_link, replica_public_host)
+    except OSError as error:
+        raise SystemExit(f"Could not resolve a network address: {error}")
     except KeyboardInterrupt:
         log_utils.log(args.lfd_id, "Shutting down (Ctrl-C).", category="lifecycle")
 
