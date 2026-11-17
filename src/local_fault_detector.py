@@ -22,10 +22,18 @@ behaves identically to before, with zero GFD involvement):
     share the LFD's single GFD connection with the GFD_HELLO heartbeat
     above (per the assignment: "1 TCP/IP connection to the GFD"), guarded
     by a lock since two threads can now write to that one socket.
+
+Milestone 5 adds an opt-in local recovery agent. The RM still owns the
+decision: RM -> GFD -> LFD sends RECOVER_REPLICA after a membership deletion.
+Only then does the co-located LFD launch its configured argv. The command is
+never interpreted by a shell, duplicate requests are idempotent, and launch
+errors are logged so the RM's next retry can try again.
 """
 
 import argparse
+from pathlib import Path
 import socket
+import subprocess
 import threading
 import time
 
@@ -43,6 +51,72 @@ _TIMEOUT_MULTIPLIER = 2.0
 _GFD_TIMEOUTS_BEFORE_RECONNECT = 3
 
 
+class ReplicaRecoveryAgent:
+    """Idempotently launch one co-located replica for an RM recovery epoch."""
+
+    def __init__(
+        self,
+        lfd_id: str,
+        replica_id: str,
+        command: list,
+        pid_file: str = None,
+    ):
+        self.lfd_id = lfd_id
+        self.replica_id = replica_id
+        self.command = list(command)
+        self.pid_file = Path(pid_file) if pid_file is not None else None
+        self._lock = threading.Lock()
+        self._process = None
+        self._last_epoch = None
+
+    def recover(self, recovery_epoch: int) -> None:
+        """Start the replica unless a prior request still has one running."""
+        with self._lock:
+            if self._process is not None and self._process.poll() is None:
+                log_utils.log(
+                    self.lfd_id,
+                    f"Ignored duplicate recovery epoch {recovery_epoch} for "
+                    f"{self.replica_id}; PID {self._process.pid} is running.",
+                    category="lifecycle",
+                )
+                return
+
+            try:
+                # A list plus shell=False is deliberately used here. Recovery
+                # configuration may contain addresses and paths, and none of
+                # them should ever become shell syntax on Windows or POSIX.
+                self._process = subprocess.Popen(self.command, shell=False)
+                self._last_epoch = recovery_epoch
+                if self.pid_file is not None:
+                    try:
+                        self.pid_file.write_text(
+                            str(self._process.pid),
+                            encoding="utf-8",
+                        )
+                    except OSError as error:
+                        log_utils.log(
+                            self.lfd_id,
+                            f"Could not update recovery PID file "
+                            f"{self.pid_file}: {error}.",
+                            category="failure",
+                        )
+                log_utils.log(
+                    self.lfd_id,
+                    f"Automatically relaunched {self.replica_id} for RM "
+                    f"recovery epoch {recovery_epoch} as PID "
+                    f"{self._process.pid}.",
+                    category="lifecycle",
+                )
+            except (OSError, ValueError) as error:
+                self._process = None
+                log_utils.log(
+                    self.lfd_id,
+                    f"Automatic relaunch of {self.replica_id} failed: "
+                    f"{error}; waiting for the RM retry.",
+                    category="failure",
+                )
+
+
 class GFDLink:
     """Thread-safe wrapper around the LFD's one persistent socket to the GFD.
 
@@ -52,13 +126,34 @@ class GFDLink:
     reads from this socket, so there's no equivalent need to guard reads.
     """
 
-    def __init__(self, lfd_id: str, gfd_host: str, gfd_port: int):
+    def __init__(
+        self,
+        lfd_id: str,
+        gfd_host: str,
+        gfd_port: int,
+        recovery_replica_id: str = None,
+    ):
         self.lfd_id = lfd_id
         self.gfd_host = gfd_host
         self.gfd_port = gfd_port
+        self.recovery_replica_id = recovery_replica_id
         self.sock = _open_gfd_socket(lfd_id, gfd_host, gfd_port)
         self._lock = threading.Lock()
         self._reconnected = threading.Event()
+        self._register_recovery_agent()
+
+    def _register_recovery_agent(self) -> None:
+        """Advertise M5 support on each new GFD connection."""
+        if self.recovery_replica_id is None:
+            return
+
+        protocol.send_line(
+            self.sock,
+            protocol.build_recovery_hello(
+                self.lfd_id,
+                self.recovery_replica_id,
+            ),
+        )
 
     def reconnect(self, timeout_sec: float) -> None:
         """Replace a lost GFD connection, retrying until the GFD is reachable."""
@@ -72,6 +167,7 @@ class GFDLink:
 
         with self._lock:
             self.sock = new_sock
+            self._register_recovery_agent()
 
         self._reconnected.set()
 
@@ -114,7 +210,12 @@ def _open_gfd_socket(lfd_id: str, gfd_host: str, gfd_port: int) -> socket.socket
             time.sleep(1.0)
 
 
-def run_gfd_heartbeat_loop(lfd_id: str, gfd_link: GFDLink, heartbeat_freq_sec: float) -> None:
+def run_gfd_heartbeat_loop(
+    lfd_id: str,
+    gfd_link: GFDLink,
+    heartbeat_freq_sec: float,
+    recovery_agent: ReplicaRecoveryAgent = None,
+) -> None:
     """Heartbeat the GFD forever, exactly like the replica-heartbeat loop
     below heartbeats the replica - just one level up the hierarchy. Runs in
     its own thread so a slow/failed replica never blocks this heartbeat,
@@ -135,11 +236,43 @@ def run_gfd_heartbeat_loop(lfd_id: str, gfd_link: GFDLink, heartbeat_freq_sec: f
                 category="heartbeat",
             )
 
-            reply_line = protocol.receive_line(gfd_link.sock)
-            if not reply_line:
-                raise ConnectionError("Connection closed by GFD")
+            # RECOVER_REPLICA is asynchronous and can arrive immediately
+            # before the ACK. Consume control messages until this heartbeat's
+            # own ACK arrives, keeping one reader for the one GFD socket.
+            while True:
+                reply_line = protocol.receive_line(gfd_link.sock)
+                if not reply_line:
+                    raise ConnectionError("Connection closed by GFD")
 
-            protocol.parse_message(reply_line)
+                reply = protocol.parse_message(reply_line)
+
+                if reply["type"] == protocol.RECOVER_REPLICA:
+                    if (
+                        recovery_agent is not None
+                        and reply["replica_id"] == recovery_agent.replica_id
+                    ):
+                        recovery_agent.recover(reply["recovery_epoch"])
+                    else:
+                        log_utils.log(
+                            lfd_id,
+                            f"Ignored recovery command for "
+                            f"{reply['replica_id']}; this LFD has no matching "
+                            "recovery configuration.",
+                            category="failure",
+                        )
+                    continue
+
+                if (
+                    reply["type"] != protocol.GFD_ACK
+                    or reply["lfd_id"] != lfd_id
+                    or reply["heartbeat_count"] != heartbeat_count
+                ):
+                    raise ValueError(
+                        f"Unexpected GFD reply while awaiting heartbeat "
+                        f"{heartbeat_count}: {reply!r}"
+                    )
+                break
+
             log_utils.log(
                 lfd_id,
                 f"[{heartbeat_count}] LFD received heartbeat ACK from GFD",
@@ -290,10 +423,37 @@ def main() -> None:
              "Distinct from --server-host, which is how the LFD itself reaches its co-located replica "
              "(normally 'localhost') and is never sent anywhere.",
     )
+    parser.add_argument(
+        "--recovery-pid-file",
+        default=None,
+        help="M5 demo/test aid: write the PID of each automatically launched "
+             "replica here so a later fault can target the recovered process.",
+    )
+    parser.add_argument(
+        "--recovery-command",
+        nargs=argparse.REMAINDER,
+        default=None,
+        help="M5: argv used to relaunch this replica after an RM request. "
+             "This option must be last; the command is executed without a shell.",
+    )
     args = parser.parse_args()
 
     if args.heartbeat_freq <= 0:
         raise SystemExit("--heartbeat-freq must be a positive number of seconds.")
+
+    if args.recovery_command is not None and not args.recovery_command:
+        raise SystemExit("--recovery-command requires an executable and arguments.")
+
+    if args.recovery_pid_file is not None and args.recovery_command is None:
+        raise SystemExit("--recovery-pid-file requires --recovery-command.")
+
+    if args.recovery_command is not None and (
+        args.gfd_host is None or args.gfd_port is None
+    ):
+        raise SystemExit(
+            "--recovery-command requires --gfd-host and --gfd-port so the RM "
+            "can request recovery."
+        )
 
     # Every other process (client.py, server_replica.py, gfd.py) already
     # catches Ctrl-C cleanly; this file was just missed. Ctrl-C can land in
@@ -306,7 +466,15 @@ def main() -> None:
     # one of those spots, rather than just the last call made.
     try:
         gfd_link = None
+        recovery_agent = None
         replica_public_host = None
+        if args.recovery_command is not None:
+            recovery_agent = ReplicaRecoveryAgent(
+                args.lfd_id,
+                args.replica_id,
+                args.recovery_command,
+                pid_file=args.recovery_pid_file,
+            )
         if args.gfd_host is not None and args.gfd_port is not None:
             replica_public_host = args.replica_public_host or net_utils.local_ip_toward(args.gfd_host)
             if net_utils.is_loopback(replica_public_host) and not net_utils.is_loopback(args.gfd_host):
@@ -314,10 +482,22 @@ def main() -> None:
                                  "but the GFD is on another one. Use this machine's network IP.")
             log_utils.log(args.lfd_id, f"Other machines will reach {args.replica_id} at "
                                        f"{replica_public_host}:{args.server_port}", category="lifecycle")
-            gfd_link = GFDLink(args.lfd_id, args.gfd_host, args.gfd_port)
+            gfd_link = GFDLink(
+                args.lfd_id,
+                args.gfd_host,
+                args.gfd_port,
+                recovery_replica_id=(
+                    args.replica_id if recovery_agent is not None else None
+                ),
+            )
             gfd_thread = threading.Thread(
                 target=run_gfd_heartbeat_loop,
-                args=(args.lfd_id, gfd_link, args.heartbeat_freq),
+                args=(
+                    args.lfd_id,
+                    gfd_link,
+                    args.heartbeat_freq,
+                    recovery_agent,
+                ),
                 daemon=True,
             )
             gfd_thread.start()

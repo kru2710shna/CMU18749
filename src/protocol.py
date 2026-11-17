@@ -1,5 +1,5 @@
 """
-Shared wire protocol for Milestones 1 through 4.
+Shared wire protocol for Milestones 1 through 5.
 
 M1:
     REQUEST|<client_id>|<replica_id>|<request_num>|<op>|<value>
@@ -22,6 +22,15 @@ M4:
     VIEW|<view_num>|<primary_id>|<ready_id>,...|<replica_id>:<host>:<port>,...
     REPLICA_HELLO|<replica_id>
     REPLICA_STATUS|<replica_id>|<i_am_ready>
+
+M5:
+    RECOVERY_HELLO|<lfd_id>|<replica_id>
+    RECOVER_REPLICA|<replica_id>|<recovery_epoch>
+
+RECOVERY_HELLO advertises that an LFD can relaunch its co-located replica.
+The RM sends RECOVER_REPLICA through the existing RM-GFD-LFD hierarchy after
+that replica leaves membership.  recovery_epoch identifies one failure event;
+retries for the same event carry the same value and are safe to repeat.
 
 <stable_request_num> tells a passive client which of its requests are covered
 by a checkpoint the backups hold. <primary_id> is empty in active replication.
@@ -49,6 +58,9 @@ CHECKPOINT = "CHECKPOINT"
 VIEW = "VIEW"
 REPLICA_HELLO = "REPLICA_HELLO"
 REPLICA_STATUS = "REPLICA_STATUS"
+
+RECOVERY_HELLO = "RECOVERY_HELLO"
+RECOVER_REPLICA = "RECOVER_REPLICA"
 
 _DELIMITER = "|"
 _ENCODING = "utf-8"
@@ -202,6 +214,18 @@ def build_replica_status(replica_id: str, i_am_ready: int) -> str:
     return _DELIMITER.join([REPLICA_STATUS, replica_id, str(i_am_ready)])
 
 
+def build_recovery_hello(lfd_id: str, replica_id: str) -> str:
+    """Register an LFD as the local recovery agent for one replica."""
+    return _DELIMITER.join([RECOVERY_HELLO, lfd_id, replica_id])
+
+
+def build_recover_replica(replica_id: str, recovery_epoch: int) -> str:
+    """Ask a registered LFD to launch its replica without using a shell."""
+    return _DELIMITER.join(
+        [RECOVER_REPLICA, replica_id, str(recovery_epoch)]
+    )
+
+
 def parse_message(line: str) -> dict:
     """Parse one complete protocol message into a dictionary."""
     try:
@@ -317,6 +341,20 @@ def _parse_message_fields(line: str) -> dict:
             "type": message_type,
             "replica_id": fields[1],
             "i_am_ready": int(fields[2]),
+        }
+
+    elif message_type == RECOVERY_HELLO:
+        return {
+            "type": message_type,
+            "lfd_id": fields[1],
+            "replica_id": fields[2],
+        }
+
+    elif message_type == RECOVER_REPLICA:
+        return {
+            "type": message_type,
+            "replica_id": fields[1],
+            "recovery_epoch": int(fields[2]),
         }
 
     raise ValueError(f"Unknown message type: {message_type!r}")

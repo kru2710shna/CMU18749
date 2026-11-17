@@ -23,9 +23,159 @@ The project is demonstrated through terminal output. No website, database, Docke
 | 2: active replication with GFD | Implemented |
 | 3: passive replication with checkpoints | Implemented |
 | 4: RM, manual recovery, primary re-election | Implemented; see [Milestone 4](#milestone-4) |
-| 5: automatic recovery | Not started |
+| 5: automatic recovery | Implemented and verified in active/passive modes |
 
 See [AGENT_CONTEXT.md](AGENT_CONTEXT.md) for Milestone 1 design decisions and the bugs found and fixed during testing.
+
+## Milestone 5
+
+Milestone 5 adds RM-directed automatic process recovery while preserving the
+Milestone 4 membership, election, checkpoint, duplicate-detection, and
+readiness behavior.
+
+### Recovery architecture
+
+```mermaid
+sequenceDiagram
+  participant S as Failed replica SN
+  participant L as Co-located LFDN
+  participant G as GFD
+  participant R as RM
+  L->>G: MEMBER_DELETE(SN)
+  G->>R: MEMBERSHIP without SN
+  R->>G: RECOVER_REPLICA(SN, epoch)
+  G->>L: RECOVER_REPLICA(SN, epoch)
+  L->>S: launch configured argv (no shell)
+  S->>R: REPLICA_HELLO / i_am_ready=0
+  L->>G: MEMBER_ADD(SN)
+  Note over S,R: Existing M4 checkpoint transfer and readiness
+  S->>R: REPLICA_STATUS(SN, 1)
+```
+
+The RM owns the recovery decision but cannot directly create a process on a
+different machine. It therefore sends the decision through the existing GFD
+connection to the already co-located LFD. The LFD is only a local execution
+agent. This adds no SSH, shared filesystem, platform-specific service manager,
+or new required network connection.
+
+Recovery is deliberately opt-in:
+
+- The RM must receive `--auto-recovery`. Without it, Milestone 4 remains manual.
+- An LFD must receive `--recovery-command ...` as its final option. Without it,
+  that LFD behaves exactly as it did in Milestones 1-4.
+- The command is an argument list executed with `shell=False`, so spaces,
+  addresses, and paths are not interpreted as shell syntax.
+- The RM assigns one epoch per observed failure and retries it until membership
+  returns. The LFD ignores a retry while its launched process is still alive.
+  A launch error is logged rather than crashing the LFD; the next RM retry can
+  try again.
+- Rejoining membership does not make a replica ready. The existing Milestone 4
+  state transfer runs unchanged. In passive mode a recovered old primary comes
+  back as a backup because the replacement primary remains elected.
+- Automatic process recovery requires that the co-located LFD and its machine
+  are still running. If the entire machine is unavailable, the RM keeps
+  retrying and logs that no recovery agent is connected; it cannot power on or
+  replace a physical machine, which is outside the milestone fault model.
+
+### Full local test in one terminal
+
+No tmux or third-party package is required. Each command starts RM, GFD, three
+LFDs, three replicas, and three continuously sending clients; injects all three
+rubric faults; and cleans everything up afterward. It dynamically chooses free
+ports, so it does not interfere with the normal demo ports.
+
+```text
+# Windows (PowerShell/cmd), macOS, or Linux
+python run_m5_local.py --mode active
+python run_m5_local.py --mode passive
+
+# Concise automated verification
+python run_m5_local.py --mode active --quiet
+python run_m5_local.py --mode passive --quiet
+
+# Exercise a different first victim / initial passive primary
+python run_m5_local.py --mode active --first-fault S3 --quiet
+python run_m5_local.py --mode passive --first-fault S3 --quiet
+
+# Focused protocol/RM/GFD/LFD regression tests
+python -m unittest discover -s tests -v
+```
+
+The test fails unless every fault is detected, the RM restores a checkpointed
+three-ready-replica group, and C1, C2, and C3 each receive replies during every
+recovery window. By default, passive mode kills primary S1, verifies election
+of S2, kills recovered S1 again as a backup, and finally kills backup S3;
+active mode kills S1, recovered S1, and then S2. `--first-fault` changes the
+first victim and, in passive mode, the launch order/initial primary, proving
+that no primary identity is hard-coded.
+
+### Demo on four separate machines (Windows/macOS/Linux)
+
+Use one console per physical machine. All machines need the same checkout and
+Python 3; tmux is not required. Replace `python` with `python3` where needed.
+
+On the sacred machine:
+
+```text
+python run_m5_device.py sacred active
+# or: python run_m5_device.py sacred passive
+```
+
+On replica machines 1, 2, and 3, respectively:
+
+```text
+python run_m5_device.py replica 1 active <SACRED_IP>
+python run_m5_device.py replica 2 active <SACRED_IP>
+python run_m5_device.py replica 3 active <SACRED_IP>
+```
+
+Use `passive` in all four commands for the passive demo. The default ports are
+RM 6100, GFD 6000, and replicas 5001-5003; every timing and port has a named
+command-line option shown by `python run_m5_device.py <role> --help`.
+
+Demo sequence:
+
+1. Start the sacred command. It boots RM and GFD in a clean zero-member state.
+2. Start all three replica-machine commands. Each boots its LFD and registers
+   its local recovery agent, but does not start the replica yet.
+3. Enter `start` in each replica console. In passive mode, whichever console
+   receives `start` first becomes primary; no replica ID is hard-coded.
+4. After the sacred console reports three ready replicas, enter `clients` there.
+5. Enter `kill` in any replica console. The LFD detects it and the RM relaunches
+   it automatically. Wait for `i_am_ready = 1 after checkpoint` and three RM
+   members. Enter `kill` in that same console again to kill the recovered PID.
+6. After its second recovery, enter `kill` on a different replica console. For
+   the passive rubric, choose a backup rather than the newly elected primary.
+7. Enter `quit` on every console to stop that machine's processes cleanly.
+
+The replica console also accepts `status`. After recovery, server output has an
+outer `[LFDN]` multiplexing prefix because the LFD owns the recovered child;
+the application's own timestamped line still carries the correct `[SN]`
+identity. This is only display multiplexing and does not combine the processes.
+
+### Raw component commands
+
+The launcher only assembles normal component commands. For a custom service
+manager, run the RM and GFD on the sacred machine as follows:
+
+```text
+python src/replication_manager.py --host 0.0.0.0 --port 6100 --replication-mode <active|passive> --auto-recovery --recovery-retry 2
+python src/global_fault_detector.py --host 0.0.0.0 --port 6000 --rm-host 127.0.0.1 --rm-port 6100
+```
+
+On each replica machine, start its LFD with the full server command last. The
+following is one line; substitute `N`, mode, sacred IP, and the absolute local
+checkout path. Add `--checkpoint-freq 2` to the recovery command in passive
+mode.
+
+```text
+python src/local_fault_detector.py --lfd-id LFDN --replica-id SN --server-host 127.0.0.1 --server-port 500N --heartbeat-freq 1 --gfd-host <SACRED_IP> --gfd-port 6000 --recovery-command python -u <ABS_PROJECT_PATH>/src/server_replica.py --replica-id SN --host 0.0.0.0 --port 500N --replication-mode <active|passive> --rm-host <SACRED_IP> --rm-port 6100 --state-transfer-delay 3
+```
+
+Launch the initial replica with the same `server_replica.py` portion of that
+command. Clients use the existing Milestone 4 commands. Keeping the recovery
+command last is required because all remaining arguments belong to the server,
+not the LFD.
 
 ## Milestone 4
 
@@ -152,7 +302,8 @@ When the device returns, its LFD reconnects and registers the replica again. Bec
 - **Restarting a client without restarting the servers misbehaves.** The new process starts again at `request_num` 1, so its requests count as duplicates until it passes its old number. Restart the whole demo instead.
 - **If every replica fails, the state is lost.** The next replica starts as the first of its kind with `my_state = 0`.
 - **A crash detected falsely is not handled.** A slow primary that the LFD reports as failed would still believe it is primary until it receives the next view.
-- **Automatic relaunch is Milestone 5.** Failed replicas must be relaunched by hand.
+- **The Milestone 4 launcher is intentionally manual.** Failed replicas must be
+  relaunched by hand unless the Milestone 5 opt-in flags/launchers above are used.
 
 ## Milestone 1
 
@@ -241,6 +392,10 @@ project/
     replication_manager.py
   run_demo.sh
   run_device_M4.sh
+  run_m5_local.py
+  run_m5_device.py
+  tests/
+    test_m5_recovery.py
   README.md
   AGENT_CONTEXT.md
 ```
@@ -257,6 +412,9 @@ project/
 | `replication_manager.py` | Runs the RM: decides which replicas are ready and which is primary. |
 | `run_demo.sh` | Launches the Milestone 1 demo in one tmux window (single laptop). |
 | `run_device_M4.sh` | Starts one device's share of the Milestone 4 system (separate devices). |
+| `run_m5_local.py` | Runs and verifies all active/passive Milestone 5 fault scenarios in one terminal. |
+| `run_m5_device.py` | Starts one physical machine's Milestone 5 processes in one cross-platform console. |
+| `tests/test_m5_recovery.py` | Unit coverage for recovery messages, RM decisions, GFD relay, and idempotent launches. |
 
 ### Development mode: one laptop
 

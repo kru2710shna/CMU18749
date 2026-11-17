@@ -867,7 +867,7 @@ class ServerReplica:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run an M1-M4 stateful server replica."
+        description="Run an M1-M5 stateful server replica."
     )
 
     parser.add_argument(
