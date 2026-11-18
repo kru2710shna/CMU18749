@@ -38,6 +38,11 @@ the RM at startup and reports every membership change to it. Clients are then
 told about changes only once the RM answers with a VIEW, so that each update
 they receive also names the current primary.
 
+Milestone 5 keeps this architecture intact: an auto-recovery decision from the
+RM is relayed over the existing RM-GFD connection and then the existing
+GFD-LFD connection. An LFD opts in with RECOVERY_HELLO, so old M1-M4 command
+lines retain their original manual-recovery behavior.
+
 Per the assignment, the failure of an LFD is the failure of its whole machine.
 So if an LFD's connection closes, or it sends nothing for --lfd-timeout seconds
 (a machine losing power never closes its connections), the GFD removes every
@@ -58,6 +63,9 @@ class GlobalFaultDetector:
         self.lfd_timeout = lfd_timeout
         # replica_id -> the LFD connection that registered it.
         self._member_owner = {}
+        # replica_id -> LFD connection capable of launching it. Unlike
+        # _member_owner, this remains registered while the replica is down.
+        self._recovery_agents = {}
         self._rm_sock = None
         # Latest (members, primary_id) from the RM. Unused without an RM.
         self._view_members = []
@@ -72,6 +80,9 @@ class GlobalFaultDetector:
         # Guards membership since multiple LFD connections (one thread
         # each, via net_utils) can send MEMBER_ADD/MEMBER_DELETE concurrently.
         self._membership_lock = threading.Lock()
+        # GFD_ACKs and asynchronous recovery commands share LFD sockets.
+        # Serialize complete lines so concurrent sends cannot interleave.
+        self._lfd_send_lock = threading.Lock()
         # Every currently-connected client's socket, so a membership change
         # can be broadcast to all of them. Guarded by its own lock since
         # clients connect/disconnect from their own per-connection threads.
@@ -123,6 +134,8 @@ class GlobalFaultDetector:
                         self._view_members = message["members"]
                         self._view_primary = message["primary_id"]
                     self._broadcast_membership()
+                elif message["type"] == protocol.RECOVER_REPLICA:
+                    self._forward_recovery_request(message)
         except (OSError, ValueError) as error:
             log_utils.log("GFD", f"RM connection failed: {error}", category="failure")
         log_utils.log("GFD", "RM connection closed; clients get no more updates.", category="failure")
@@ -166,6 +179,8 @@ class GlobalFaultDetector:
                         self._handle_member_add(conn, message)
                     elif message["type"] == protocol.MEMBER_DELETE:
                         self._handle_member_delete(message)
+                    elif message["type"] == protocol.RECOVERY_HELLO:
+                        self._handle_recovery_hello(conn, message)
                     elif message["type"] == protocol.CLIENT_HELLO:
                         is_client = True
                         self._handle_client_hello(conn, message)
@@ -199,7 +214,8 @@ class GlobalFaultDetector:
             category="heartbeat",
         )
         ack_line = protocol.build_gfd_ack(lfd_id, heartbeat_count)
-        protocol.send_line(conn, ack_line)
+        with self._lfd_send_lock:
+            protocol.send_line(conn, ack_line)
         log_utils.log(
             "GFD",
             f"[{heartbeat_count}] GFD sending heartbeat ACK to {lfd_id}",
@@ -220,6 +236,9 @@ class GlobalFaultDetector:
                     log_utils.log("GFD", f"Removing server {replica_id} (lost {lfd_id})...", category="membership")
                     self._print_membership()
                     changed = True
+            for replica_id, agent_conn in list(self._recovery_agents.items()):
+                if agent_conn is conn:
+                    del self._recovery_agents[replica_id]
             if changed and self._rm_sock is not None:
                 self._report_membership_to_rm()
         if changed and self._rm_sock is None:
@@ -256,6 +275,59 @@ class GlobalFaultDetector:
                     self._report_membership_to_rm()
         if changed and self._rm_sock is None:
             self._broadcast_membership()
+
+    def _handle_recovery_hello(self, conn, message: dict) -> None:
+        """Remember where the RM can reach a replica's local launcher."""
+        replica_id = message["replica_id"]
+
+        with self._membership_lock:
+            self._recovery_agents[replica_id] = conn
+
+        log_utils.log(
+            "GFD",
+            f"{message['lfd_id']} registered as the automatic recovery "
+            f"agent for {replica_id}.",
+            category="lifecycle",
+        )
+
+    def _forward_recovery_request(self, message: dict) -> None:
+        """Relay one RM decision to the LFD on the replica's own machine."""
+        replica_id = message["replica_id"]
+
+        with self._membership_lock:
+            conn = self._recovery_agents.get(replica_id)
+
+        if conn is None:
+            log_utils.log(
+                "GFD",
+                f"RM requested recovery of {replica_id}, but no LFD recovery "
+                "agent is connected; the RM will retry.",
+                category="failure",
+            )
+            return
+
+        try:
+            with self._lfd_send_lock:
+                protocol.send_line(
+                    conn,
+                    protocol.build_recover_replica(
+                        replica_id,
+                        message["recovery_epoch"],
+                    ),
+                )
+            log_utils.log(
+                "GFD",
+                f"Relayed RM recovery epoch {message['recovery_epoch']} "
+                f"for {replica_id} to its LFD.",
+                category="membership",
+            )
+        except OSError as error:
+            log_utils.log(
+                "GFD",
+                f"Could not relay recovery of {replica_id}: {error}; "
+                "the RM will retry.",
+                category="failure",
+            )
 
     def _client_view(self) -> tuple:
         """Return the MEMBERSHIP line for clients and its member count.

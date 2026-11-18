@@ -950,7 +950,7 @@ def run_client_via_gfd(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Run an M1-M4 client."
+        description="Run an M1-M5 client."
     )
 
     parser.add_argument(

@@ -1,5 +1,5 @@
 """
-RM: the Replication Manager, new in Milestone 4.
+RM: the Replication Manager, introduced in Milestone 4.
 
 The RM sits above the GFD and owns the decisions the fault detectors do not
 make: which replicas are ready to serve and, in passive replication, which one
@@ -18,10 +18,18 @@ Rules:
 - The primary is the first ready replica to show up. When it leaves, the RM
   elects the earliest-joined ready replica, so a relaunched replica always
   comes back as a backup.
+
+Milestone 5 adds optional automated recovery without changing those rules.
+With --auto-recovery, a membership transition from present to absent starts a
+recovery epoch.  The RM sends RECOVER_REPLICA through the existing GFD link,
+and retries the same epoch until the GFD reports that the replica has rejoined.
+The GFD relays the decision to the co-located LFD, which is the only component
+that can safely create a process on that remote replica machine.
 """
 
 import argparse
 import threading
+import time
 
 import log_utils
 import net_utils
@@ -29,8 +37,15 @@ import protocol
 
 
 class ReplicationManager:
-    def __init__(self, replication_mode: str):
+    def __init__(
+        self,
+        replication_mode: str,
+        auto_recovery: bool = False,
+        recovery_retry_sec: float = 2.0,
+    ):
         self.replication_mode = replication_mode
+        self.auto_recovery = auto_recovery
+        self.recovery_retry_sec = recovery_retry_sec
 
         # replica_id -> (host, port), in the order the replicas joined.
         self.membership = {}
@@ -44,6 +59,12 @@ class ReplicationManager:
         self._gfd_conn = None
         self._replica_conns = {}
 
+        # replica_id -> recovery_epoch. An entry exists from the first
+        # membership deletion until that replica is observed in membership
+        # again. The epoch makes repeated delivery idempotent at the LFD.
+        self._pending_recoveries = {}
+        self._next_recovery_epoch = 1
+
     def run(self, host: str, port: int) -> None:
         net_utils.start_tcp_server(host, port, self._handle_connection)
         log_utils.log("RM", f"Listening on {host}:{port}", category="lifecycle")
@@ -52,6 +73,16 @@ class ReplicationManager:
             f"Replication mode = {self.replication_mode}",
             category="lifecycle",
         )
+        if self.auto_recovery:
+            log_utils.log(
+                "RM",
+                "Milestone 5 automatic recovery is enabled.",
+                category="lifecycle",
+            )
+            threading.Thread(
+                target=self._recovery_retry_loop,
+                daemon=True,
+            ).start()
         self._print_membership()
 
     def _print_membership(self) -> None:
@@ -113,6 +144,7 @@ class ReplicationManager:
                 self._gfd_conn = conn
                 log_utils.log("RM", "GFD registered.", category="lifecycle")
 
+            previous_members = set(self.membership)
             self.membership = {
                 replica_id: (host, port)
                 for replica_id, host, port in message["members"]
@@ -120,8 +152,75 @@ class ReplicationManager:
             self.member_count = len(self.membership)
             self.ready &= set(self.membership)
 
+            if self.auto_recovery:
+                current_members = set(self.membership)
+
+                # Rejoining membership is the success condition. It happens
+                # before state transfer; existing M4 readiness logic keeps the
+                # newborn process from serving until its checkpoint arrives.
+                for replica_id in current_members:
+                    if replica_id in self._pending_recoveries:
+                        epoch = self._pending_recoveries.pop(replica_id)
+                        log_utils.log(
+                            "RM",
+                            f"Automatic recovery of {replica_id} completed "
+                            f"(epoch {epoch}); replica rejoined membership.",
+                            category="lifecycle",
+                        )
+
+                for replica_id in previous_members - current_members:
+                    if replica_id not in self._pending_recoveries:
+                        epoch = self._next_recovery_epoch
+                        self._next_recovery_epoch += 1
+                        self._pending_recoveries[replica_id] = epoch
+                        log_utils.log(
+                            "RM",
+                            f"Detected failure of {replica_id}; starting "
+                            f"automatic recovery epoch {epoch}.",
+                            category="failure",
+                        )
+
             self._print_membership()
             self._publish_view()
+
+            if self.auto_recovery:
+                for replica_id in previous_members - set(self.membership):
+                    self._send_recovery_request(replica_id)
+
+    def _recovery_retry_loop(self) -> None:
+        """Retry outstanding RM decisions until membership proves success."""
+        while True:
+            time.sleep(self.recovery_retry_sec)
+
+            with self._lock:
+                for replica_id in list(self._pending_recoveries):
+                    self._send_recovery_request(replica_id)
+
+    def _send_recovery_request(self, replica_id: str) -> None:
+        """Send one recovery attempt while the caller holds ``_lock``."""
+        epoch = self._pending_recoveries.get(replica_id)
+
+        if epoch is None or self._gfd_conn is None:
+            return
+
+        try:
+            protocol.send_line(
+                self._gfd_conn,
+                protocol.build_recover_replica(replica_id, epoch),
+            )
+            log_utils.log(
+                "RM",
+                f"Requested automatic relaunch of {replica_id} "
+                f"(epoch {epoch}).",
+                category="membership",
+            )
+        except OSError as error:
+            log_utils.log(
+                "RM",
+                f"Could not request recovery of {replica_id}: {error}; "
+                "will retry.",
+                category="failure",
+            )
 
     def _handle_replica_hello(self, conn, replica_id: str) -> None:
         with self._lock:
@@ -278,9 +377,27 @@ def main() -> None:
         required=True,
         help="passive also makes the RM elect a primary.",
     )
+    parser.add_argument(
+        "--auto-recovery",
+        action="store_true",
+        help="M5: ask the failed replica's LFD to relaunch it automatically.",
+    )
+    parser.add_argument(
+        "--recovery-retry",
+        type=float,
+        default=2.0,
+        help="M5: seconds between recovery retries (default: 2).",
+    )
     args = parser.parse_args()
 
-    manager = ReplicationManager(args.replication_mode)
+    if args.recovery_retry <= 0:
+        raise SystemExit("--recovery-retry must be positive.")
+
+    manager = ReplicationManager(
+        args.replication_mode,
+        auto_recovery=args.auto_recovery,
+        recovery_retry_sec=args.recovery_retry,
+    )
     manager.run(args.host, args.port)
 
     try:
