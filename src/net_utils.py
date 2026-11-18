@@ -15,6 +15,9 @@ import socket
 import threading
 from typing import Callable
 
+# Without a limit, connecting to a powered-off machine blocks for over a minute.
+_CONNECT_TIMEOUT_SEC = 3.0
+
 
 def start_tcp_server(host: str, port: int, handle_connection: Callable[[socket.socket, tuple], None]) -> socket.socket:
     """Start listening on (host, port) and spawn a thread per accepted connection.
@@ -49,5 +52,28 @@ def start_tcp_server(host: str, port: int, handle_connection: Callable[[socket.s
 def connect_to_server(host: str, port: int) -> socket.socket:
     """Open a single TCP connection to (host, port) and return the socket."""
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.connect((host, port))
+    client_socket.settimeout(_CONNECT_TIMEOUT_SEC)
+
+    try:
+        client_socket.connect((host, port))
+    except OSError:
+        client_socket.close()
+        raise
+
+    client_socket.settimeout(None)
     return client_socket
+
+
+def local_ip_toward(host: str) -> str:
+    """Return this machine's IP address on the network that reaches host.
+
+    Connecting a UDP socket only picks a route; it sends no packets.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.connect((host, 9))
+        return probe.getsockname()[0]
+
+
+def is_loopback(host: str) -> bool:
+    """Return whether host names this machine only (localhost, 127.x.x.x)."""
+    return socket.gethostbyname(host).startswith("127.")
