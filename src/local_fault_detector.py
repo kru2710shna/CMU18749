@@ -27,13 +27,17 @@ Milestone 5 adds an opt-in local recovery agent. The RM still owns the
 decision: RM -> GFD -> LFD sends RECOVER_REPLICA after a membership deletion.
 Only then does the co-located LFD launch its configured argv. The command is
 never interpreted by a shell, duplicate requests are idempotent, and launch
-errors are logged so the RM's next retry can try again.
+errors are logged so the RM's next retry can try again. For the normal
+co-located server, --auto-recovery derives the server_replica.py path, replica
+ID, and port from this LFD; --recovery-command remains available for custom
+process managers and demo tooling.
 """
 
 import argparse
 from pathlib import Path
 import socket
 import subprocess
+import sys
 import threading
 import time
 
@@ -49,6 +53,47 @@ _TIMEOUT_MULTIPLIER = 2.0
 # Late GFD replies are normal on Wi-Fi, so only this many in a row count as a
 # lost connection.
 _GFD_TIMEOUTS_BEFORE_RECONNECT = 3
+
+
+def build_standard_recovery_command(
+    replica_id: str,
+    server_port: int,
+    replication_mode: str,
+    rm_host: str,
+    rm_port: int = 6100,
+    checkpoint_freq: float = 2.0,
+    state_transfer_delay: float = 3.0,
+) -> list:
+    """Build the normal co-located server command without duplicated CLI data.
+
+    The LFD and its server necessarily share a replica identity and listener
+    port. Keeping those values in one place makes the standalone M5 command
+    shorter and prevents a recovery typo from relaunching the wrong replica.
+    The path is resolved relative to this source file, so recovery does not
+    depend on the operator's current working directory.
+    """
+    command = [
+        sys.executable,
+        "-u",
+        str(Path(__file__).resolve().with_name("server_replica.py")),
+        "--replica-id",
+        replica_id,
+        "--host",
+        "0.0.0.0",
+        "--port",
+        str(server_port),
+        "--replication-mode",
+        replication_mode,
+        "--rm-host",
+        rm_host,
+        "--rm-port",
+        str(rm_port),
+        "--state-transfer-delay",
+        str(state_transfer_delay),
+    ]
+    if replication_mode == "passive":
+        command.extend(["--checkpoint-freq", str(checkpoint_freq)])
+    return command
 
 
 class ReplicaRecoveryAgent:
@@ -429,12 +474,50 @@ def main() -> None:
         help="M5 demo/test aid: write the PID of each automatically launched "
              "replica here so a later fault can target the recovered process.",
     )
-    parser.add_argument(
+    recovery_source = parser.add_mutually_exclusive_group()
+    recovery_source.add_argument(
+        "--auto-recovery",
+        action="store_true",
+        help="M5 shorthand: relaunch the co-located server_replica.py using "
+             "this LFD's --replica-id and --server-port. Requires "
+             "--replication-mode; the RM defaults to the GFD host on port 6100.",
+    )
+    recovery_source.add_argument(
         "--recovery-command",
         nargs=argparse.REMAINDER,
         default=None,
-        help="M5: argv used to relaunch this replica after an RM request. "
-             "This option must be last; the command is executed without a shell.",
+        help="M5 advanced override: argv used to relaunch this replica after "
+             "an RM request. This option must be last; the command is executed "
+             "without a shell.",
+    )
+    parser.add_argument(
+        "--replication-mode",
+        choices=["active", "passive"],
+        default=None,
+        help="Replication mode for the standard --auto-recovery server.",
+    )
+    parser.add_argument(
+        "--rm-host",
+        default=None,
+        help="RM host for --auto-recovery; defaults to --gfd-host.",
+    )
+    parser.add_argument(
+        "--rm-port",
+        type=int,
+        default=6100,
+        help="RM port for --auto-recovery (default: 6100).",
+    )
+    parser.add_argument(
+        "--checkpoint-freq",
+        type=float,
+        default=2.0,
+        help="Passive checkpoint interval for --auto-recovery (default: 2).",
+    )
+    parser.add_argument(
+        "--state-transfer-delay",
+        type=float,
+        default=3.0,
+        help="Recovered server state-transfer delay (default: 3).",
     )
     args = parser.parse_args()
 
@@ -444,15 +527,40 @@ def main() -> None:
     if args.recovery_command is not None and not args.recovery_command:
         raise SystemExit("--recovery-command requires an executable and arguments.")
 
-    if args.recovery_pid_file is not None and args.recovery_command is None:
-        raise SystemExit("--recovery-pid-file requires --recovery-command.")
+    if args.auto_recovery and args.replication_mode is None:
+        raise SystemExit("--auto-recovery requires --replication-mode.")
 
-    if args.recovery_command is not None and (
+    if not args.auto_recovery and args.replication_mode is not None:
+        raise SystemExit("--replication-mode on an LFD requires --auto-recovery.")
+
+    if args.checkpoint_freq <= 0:
+        raise SystemExit("--checkpoint-freq must be positive.")
+
+    if args.state_transfer_delay < 0:
+        raise SystemExit("--state-transfer-delay cannot be negative.")
+
+    recovery_command = args.recovery_command
+    if args.auto_recovery:
+        recovery_command = build_standard_recovery_command(
+            args.replica_id,
+            args.server_port,
+            args.replication_mode,
+            args.rm_host or args.gfd_host,
+            rm_port=args.rm_port,
+            checkpoint_freq=args.checkpoint_freq,
+            state_transfer_delay=args.state_transfer_delay,
+        )
+
+    if args.recovery_pid_file is not None and recovery_command is None:
+        raise SystemExit(
+            "--recovery-pid-file requires --auto-recovery or --recovery-command."
+        )
+
+    if recovery_command is not None and (
         args.gfd_host is None or args.gfd_port is None
     ):
         raise SystemExit(
-            "--recovery-command requires --gfd-host and --gfd-port so the RM "
-            "can request recovery."
+            "Recovery requires --gfd-host and --gfd-port so the RM can request it."
         )
 
     # Every other process (client.py, server_replica.py, gfd.py) already
@@ -468,11 +576,11 @@ def main() -> None:
         gfd_link = None
         recovery_agent = None
         replica_public_host = None
-        if args.recovery_command is not None:
+        if recovery_command is not None:
             recovery_agent = ReplicaRecoveryAgent(
                 args.lfd_id,
                 args.replica_id,
-                args.recovery_command,
+                recovery_command,
                 pid_file=args.recovery_pid_file,
             )
         if args.gfd_host is not None and args.gfd_port is not None:

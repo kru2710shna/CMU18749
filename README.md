@@ -109,6 +109,49 @@ active mode kills S1, recovered S1, and then S2. `--first-fault` changes the
 first victim and, in passive mode, the launch order/initial primary, proving
 that no primary identity is hard-coded.
 
+### Local test with separate component logs
+
+Use these launchers when demonstrating interactively and you want each
+component's output isolated. They run the same RM, GFD, LFD, server, and client
+files as the one-terminal test; the only additional helper opens recovered
+servers in replacement terminals so their logs do not appear in an LFD pane.
+
+On macOS, Linux, or WSL with tmux installed:
+
+```text
+bash run_m5_tmux.sh active
+bash run_m5_tmux.sh passive 3   # launch S3 first as passive primary
+```
+
+The tmux session contains four windows: `infrastructure`, `detectors`,
+`replicas`, and `clients`. Use `Ctrl-b n`/`Ctrl-b p` or the mouse to navigate.
+Stop everything with:
+
+```text
+tmux kill-session -t m5-local
+```
+
+On Windows PowerShell:
+
+```powershell
+.\run_m5_windows.ps1 -Mode active
+.\run_m5_windows.ps1 -Mode passive -PrimaryReplica 3
+```
+
+If local script execution is disabled, use the one-time invocation:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\run_m5_windows.ps1 -Mode active
+```
+
+PowerShell opens a titled console for every component. Keep the original
+launcher console open; pressing Enter there stops all component process trees.
+
+To inject a fault in either launcher, focus an `SN` pane/console and press
+`Ctrl-C`. The LFD detects the failure and the RM opens a separate
+`SN-recovered` pane/console. Press `Ctrl-C` there to reinject a fault into the
+recovered replica. Clients continue running throughout.
+
 ### Demo on four separate machines (Windows/macOS/Linux)
 
 Use one console per physical machine. All machines need the same checkout and
@@ -163,19 +206,21 @@ python src/replication_manager.py --host 0.0.0.0 --port 6100 --replication-mode 
 python src/global_fault_detector.py --host 0.0.0.0 --port 6000 --rm-host 127.0.0.1 --rm-port 6100
 ```
 
-On each replica machine, start its LFD with the full server command last. The
-following is one line; substitute `N`, mode, sacred IP, and the absolute local
-checkout path. Add `--checkpoint-freq 2` to the recovery command in passive
-mode.
+On each replica machine, the standalone LFD can derive the normal recovery
+command from its own replica ID and server port. It resolves the co-located
+`server_replica.py` path automatically, uses the GFD host as the RM host, and
+uses RM port 6100 by default. Substitute `N`, mode, sacred IP, and the replica
+machine's public IP:
 
 ```text
-python src/local_fault_detector.py --lfd-id LFDN --replica-id SN --server-host 127.0.0.1 --server-port 500N --heartbeat-freq 1 --gfd-host <SACRED_IP> --gfd-port 6000 --recovery-command python -u <ABS_PROJECT_PATH>/src/server_replica.py --replica-id SN --host 0.0.0.0 --port 500N --replication-mode <active|passive> --rm-host <SACRED_IP> --rm-port 6100 --state-transfer-delay 3
+python src/local_fault_detector.py --lfd-id LFDN --replica-id SN --server-host 127.0.0.1 --server-port 500N --heartbeat-freq 1 --gfd-host <SACRED_IP> --gfd-port 6000 --replica-public-host <REPLICA_IP> --auto-recovery --replication-mode <active|passive>
 ```
 
-Launch the initial replica with the same `server_replica.py` portion of that
-command. Clients use the existing Milestone 4 commands. Keeping the recovery
-command last is required because all remaining arguments belong to the server,
-not the LFD.
+Launch the initial replica with the existing `server_replica.py` command.
+Clients use the existing Milestone 4 commands. Non-default deployments can add
+`--rm-host`, `--rm-port`, `--checkpoint-freq`, or `--state-transfer-delay`.
+The original `--recovery-command <executable> ...` remains available as an
+advanced override for custom process managers; it must be the final LFD option.
 
 ## Milestone 4
 
@@ -394,6 +439,9 @@ project/
   run_device_M4.sh
   run_m5_local.py
   run_m5_device.py
+  run_m5_tmux.sh
+  run_m5_windows.ps1
+  launch_component_terminal.py
   tests/
     test_m5_recovery.py
   README.md
@@ -414,6 +462,9 @@ project/
 | `run_device_M4.sh` | Starts one device's share of the Milestone 4 system (separate devices). |
 | `run_m5_local.py` | Runs and verifies all active/passive Milestone 5 fault scenarios in one terminal. |
 | `run_m5_device.py` | Starts one physical machine's Milestone 5 processes in one cross-platform console. |
+| `run_m5_tmux.sh` | Runs the local M5 system with isolated tmux panes/windows. |
+| `run_m5_windows.ps1` | Runs the local M5 system with one Windows console per component. |
+| `launch_component_terminal.py` | Keeps recovered replicas isolated in replacement terminals while preserving idempotent recovery. |
 | `tests/test_m5_recovery.py` | Unit coverage for recovery messages, RM decisions, GFD relay, and idempotent launches. |
 
 ### Development mode: one laptop
